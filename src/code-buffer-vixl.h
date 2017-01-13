@@ -1,4 +1,4 @@
-// Copyright 2014, VIXL authors
+// Copyright 2016, VIXL authors
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -39,10 +39,20 @@ class CodeBuffer {
   static const size_t kDefaultCapacity = 4 * KBytes;
 
   explicit CodeBuffer(size_t capacity = kDefaultCapacity);
-  CodeBuffer(void* buffer, size_t capacity);
+  CodeBuffer(byte* buffer, size_t capacity);
   ~CodeBuffer();
 
   void Reset();
+
+#ifdef VIXL_CODE_BUFFER_MMAP
+  void SetExecutable();
+  void SetWritable();
+#else
+  // These require page-aligned memory blocks, which we can only guarantee with
+  // mmap.
+  VIXL_NO_RETURN_IN_DEBUG_MODE void SetExecutable() { VIXL_UNREACHABLE(); }
+  VIXL_NO_RETURN_IN_DEBUG_MODE void SetWritable() { VIXL_UNREACHABLE(); }
+#endif
 
   ptrdiff_t GetOffsetFrom(ptrdiff_t offset) const {
     ptrdiff_t cursor_offset = cursor_ - buffer_;
@@ -67,8 +77,21 @@ class CodeBuffer {
 
   template <typename T>
   T GetOffsetAddress(ptrdiff_t offset) const {
+    VIXL_STATIC_ASSERT(sizeof(T) >= sizeof(uintptr_t));
     VIXL_ASSERT((offset >= 0) && (offset <= (cursor_ - buffer_)));
     return reinterpret_cast<T>(buffer_ + offset);
+  }
+
+  // Return the address of the start or end of the buffer.
+  template <typename T>
+  T GetStartAddress() const {
+    VIXL_STATIC_ASSERT(sizeof(T) >= sizeof(uintptr_t));
+    return GetOffsetAddress<T>(0);
+  }
+  template <typename T>
+  T GetEndAddress() const {
+    VIXL_STATIC_ASSERT(sizeof(T) >= sizeof(uintptr_t));
+    return GetOffsetAddress<T>(GetCapacity());
   }
 
   size_t GetRemainingBytes() const {
@@ -77,15 +100,6 @@ class CodeBuffer {
   }
   VIXL_DEPRECATED("GetRemainingBytes", size_t RemainingBytes() const) {
     return GetRemainingBytes();
-  }
-
-  byte* GetBuffer() const { return GetOffsetAddress<byte*>(0); }
-
-  // Return the address of the start of the buffer.
-  template <typename T>
-  T GetStartAddress() const {
-    VIXL_STATIC_ASSERT(sizeof(T) >= sizeof(uintptr_t));
-    return GetOffsetAddress<T>(0);
   }
 
   size_t GetSizeInBytes() const {

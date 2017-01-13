@@ -38,8 +38,13 @@ extern "C" {
 
 #include "utils-vixl.h"
 
+#include "constants-aarch32.h"
+
 namespace vixl {
 namespace aarch32 {
+
+class VeneerPoolManager;
+class MacroAssembler;
 
 class Label {
  public:
@@ -65,10 +70,10 @@ class Label {
 
   class ForwardReference {
    public:
-    ForwardReference(ptrdiff_t location, const LabelEmitOperator& op, bool t32)
+    ForwardReference(int32_t location, const LabelEmitOperator& op, bool t32)
         : location_(location), op_(op), is_t32_(t32), is_branch_(false) {}
     Offset GetMaxForwardDistance() const { return op_.GetMaxForwardDistance(); }
-    ptrdiff_t GetLocation() const { return location_; }
+    int32_t GetLocation() const { return location_; }
     uint32_t GetStatePCOffset() const {
       return is_t32_ ? kT32PcDelta : kA32PcDelta;
     }
@@ -77,11 +82,16 @@ class Label {
     void SetIsBranch() { is_branch_ = true; }
     const LabelEmitOperator& GetEmitOperator() const { return op_; }
     Offset GetCheckpoint() const {
-      return GetMaxForwardDistance() + (GetLocation() + GetStatePCOffset());
+      // The load instructions align down PC before adding the offset.
+      // The alignment is only needed for T32 as A32 instructions are always
+      // 4 byte aligned.
+      int32_t pc = GetLocation() + GetStatePCOffset();
+      return GetMaxForwardDistance() +
+             ((IsUsingT32() && !IsBranch()) ? AlignDown(pc, 4) : pc);
     }
 
    private:
-    ptrdiff_t location_;
+    int32_t location_;
     const LabelEmitOperator& op_;
     bool is_t32_;
     bool is_branch_;
@@ -97,7 +107,7 @@ class Label {
   }
 
   Offset GetNextCheckpoint() {
-    if (IsReferenced()) {
+    if (HasForwardReference()) {
       ForwardRefList::iterator min_checkpoint =
           std::min_element(forward_.begin(),
                            forward_.end(),
@@ -114,7 +124,9 @@ class Label {
         is_bound_(false),
         minus_zero_(false),
         is_t32_(false),
-        in_veneer_pool_(false),
+        referenced_(false),
+        veneer_pool_manager_(NULL),
+        is_near_(false),
         checkpoint_(kMaxOffset) {}
   explicit Label(Offset offset, uint32_t pc_offset, bool minus_zero = false)
       : imm_offset_(offset),
@@ -122,11 +134,19 @@ class Label {
         is_bound_(true),
         minus_zero_(minus_zero),
         is_t32_(false),
-        in_veneer_pool_(false),
+        referenced_(false),
+        veneer_pool_manager_(NULL),
+        is_near_(false),
         checkpoint_(kMaxOffset) {}
-  ~Label() {}
+  ~Label() VIXL_THROW_IN_NEGATIVE_TESTING_MODE(std::runtime_error) {
+#ifdef VIXL_DEBUG
+    if (referenced_ && !is_bound_) {
+      VIXL_ABORT_WITH_MSG("Label used but not bound.\n");
+    }
+#endif
+  }
   bool IsBound() const { return is_bound_; }
-  bool IsReferenced() const { return !forward_.empty(); }
+  bool HasForwardReference() const { return !forward_.empty(); }
   void Bind(Offset offset, bool isT32) {
     VIXL_ASSERT(!IsBound());
     imm_offset_ = offset;
@@ -146,35 +166,43 @@ class Label {
     VIXL_ASSERT(IsBound());
     return minus_zero_;
   }
-  bool IsInVeneerPool() const { return in_veneer_pool_; }
-  void SetInVeneerPool() { in_veneer_pool_ = true; }
-  void ResetInVeneerPool() { in_veneer_pool_ = false; }
+  void SetReferenced() { referenced_ = true; }
+  bool IsReferenced() const { return referenced_; }
+  bool IsInVeneerPool() const { return veneer_pool_manager_ != NULL; }
+  VeneerPoolManager* GetVeneerPoolManager() const {
+    return veneer_pool_manager_;
+  }
+  void SetVeneerPoolManager(VeneerPoolManager* veneer_pool_manager,
+                            bool is_near) {
+    veneer_pool_manager_ = veneer_pool_manager;
+    is_near_ = is_near;
+  }
+  void ClearVeneerPoolManager() { veneer_pool_manager_ = NULL; }
+  bool IsNear() const { return is_near_; }
   void SetCheckpoint(Offset checkpoint) { checkpoint_ = checkpoint; }
   Offset GetCheckpoint() const { return checkpoint_; }
   Offset GetAlignedCheckpoint(int byte_align) const {
     return AlignDown(GetCheckpoint(), byte_align);
   }
-  void AddForwardRef(ptrdiff_t instr_location,
+  void AddForwardRef(int32_t instr_location,
                      bool isT32,
                      const LabelEmitOperator& op) {
+    VIXL_ASSERT(referenced_);
     forward_.push_back(ForwardReference(instr_location, op, isT32));
   }
 
   ForwardRefList::iterator GetFirstForwardRef() { return forward_.begin(); }
   ForwardRefList::iterator GetEndForwardRef() { return forward_.end(); }
+  const ForwardReference* GetForwardRefBack() const {
+    if (forward_.empty()) return NULL;
+    return &forward_.back();
+  }
   // Erase an item in the list. We don't have to recompute the checkpoint as
   // the caller does it.
   ForwardRefList::iterator Erase(ForwardRefList::iterator ref) {
     return forward_.erase(ref);
   }
   ForwardReference& GetBackForwardRef() { return forward_.back(); }
-
-  Offset GetLastInsertForwardDistance() const {
-    if (IsReferenced()) {
-      return forward_.back().GetMaxForwardDistance();
-    }
-    return kMaxOffset;
-  }
 
   void ClearForwardRef() { forward_.clear(); }
 
@@ -187,7 +215,7 @@ class Label {
   void InvalidateLastForwardReference(
       UpdateCheckpointOption update_checkpoint = kRecomputeCheckpoint) {
     if (!IsBound()) {
-      VIXL_ASSERT(IsReferenced());
+      VIXL_ASSERT(HasForwardReference());
       forward_.pop_back();
     }
     VIXL_ASSERT((update_checkpoint == kNoUpdateNecessary) &&
@@ -205,7 +233,7 @@ class Label {
   // The last forward reference is assumed to be the one freshly
   // added regarding this literal.
   void UpdateCheckpoint() {
-    if (IsReferenced()) {
+    if (HasForwardReference()) {
       const ForwardReference& ref = forward_.back();
       checkpoint_ = std::min(checkpoint_, ref.GetCheckpoint());
     }
@@ -226,14 +254,69 @@ class Label {
   bool minus_zero_;
   // Is the label in T32 state.
   bool is_t32_;
-  // True if the label has been inserted in the veneer pool.
-  bool in_veneer_pool_;
+  // True if the label has been used at least once.
+  bool referenced_;
+  // Not null if the label is currently inserted in the veneer pool.
+  VeneerPoolManager* veneer_pool_manager_;
+  // True if the label is inserted in the near_labels_ list.
+  bool is_near_;
   // Contains the references to the unbound label
   ForwardRefList forward_;
   // Max offset in the code buffer. Must be emitted before this checkpoint.
   Offset checkpoint_;
 };
 
+class VeneerPoolManager {
+ public:
+  explicit VeneerPoolManager(MacroAssembler* masm)
+      : masm_(masm),
+        near_checkpoint_(Label::kMaxOffset),
+        far_checkpoint_(Label::kMaxOffset),
+        last_label_reference_offset_(0),
+        monitor_(0) {}
+  bool IsEmpty() const {
+    return (near_labels_.size() + far_labels_.size()) == 0;
+  }
+  Label::Offset GetCheckpoint() const {
+    // For the far labels, we subtract the veneer size. This way avoids problems
+    // when two label have the same checkpoint. In the usual case, we lose some
+    // range but, as the minimum range for far labels is 1 mega byte, it's not
+    // very important.
+    size_t veneer_max_size = GetMaxSize();
+    VIXL_ASSERT(IsInt32(veneer_max_size));
+    Label::Offset tmp =
+        far_checkpoint_ - static_cast<Label::Offset>(veneer_max_size);
+    // Make room for a branch over the pools.
+    return std::min(near_checkpoint_, tmp) - kMaxInstructionSizeInBytes;
+  }
+  size_t GetMaxSize() const {
+    return (near_labels_.size() + far_labels_.size()) *
+           kMaxInstructionSizeInBytes;
+  }
+  void AddLabel(Label* label);
+  void RemoveLabel(Label* label);
+  void EmitLabel(Label* label, Label::Offset emitted_target);
+  void Emit(Label::Offset target);
+
+  void Block() { monitor_++; }
+  void Release();
+  bool IsBlocked() const { return monitor_ != 0; }
+
+ private:
+  MacroAssembler* masm_;
+  // Lists of all unbound labels which are used by a branch instruction.
+  std::list<Label*> near_labels_;
+  std::list<Label*> far_labels_;
+  // Max offset in the code buffer where the veneer needs to be emitted.
+  // A default value of Label::kMaxOffset means that the checkpoint is
+  // invalid.
+  Label::Offset near_checkpoint_;
+  Label::Offset far_checkpoint_;
+  // Offset where the last reference to a label has been added to the pool.
+  Label::Offset last_label_reference_offset_;
+  // Indicates whether the emission of this pool is blocked.
+  int monitor_;
+};
 
 }  // namespace aarch32
 }  // namespace vixl

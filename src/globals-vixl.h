@@ -53,6 +53,11 @@ extern "C" {
 
 #include "platform-vixl.h"
 
+#ifdef VIXL_NEGATIVE_TESTING
+#include <stdexcept>
+#include <string>
+#include <sstream>
+#endif
 
 namespace vixl {
 
@@ -68,32 +73,72 @@ const int kBitsPerByte = 8;
 
 }  // namespace vixl
 
-#define VIXL_ABORT()                              \
-  do {                                            \
-    printf("in %s, line %i", __FILE__, __LINE__); \
-    abort();                                      \
+// Detect the host's pointer size.
+#if (UINTPTR_MAX == UINT32_MAX)
+#define VIXL_HOST_POINTER_32
+#elif(UINTPTR_MAX == UINT64_MAX)
+#define VIXL_HOST_POINTER_64
+#else
+#error "Unsupported host pointer size."
+#endif
+
+#ifdef VIXL_NEGATIVE_TESTING
+#define VIXL_ABORT()                                                         \
+  do {                                                                       \
+    std::ostringstream oss;                                                  \
+    oss << "Aborting in " << __FILE__ << ", line " << __LINE__ << std::endl; \
+    throw std::runtime_error(oss.str());                                     \
   } while (false)
-#define VIXL_ABORT_WITH_MSG(msg) \
-  {                              \
-    printf("%s", msg);           \
-    VIXL_ABORT();                \
-  }
+#define VIXL_ABORT_WITH_MSG(msg)                                             \
+  do {                                                                       \
+    std::ostringstream oss;                                                  \
+    oss << (msg) << "in " << __FILE__ << ", line " << __LINE__ << std::endl; \
+    throw std::runtime_error(oss.str());                                     \
+  } while (false)
+#define VIXL_CHECK(condition)                                \
+  do {                                                       \
+    if (!(condition)) {                                      \
+      std::ostringstream oss;                                \
+      oss << "Assertion failed (" #condition ")\nin ";       \
+      oss << __FILE__ << ", line " << __LINE__ << std::endl; \
+      throw std::runtime_error(oss.str());                   \
+    }                                                        \
+  } while (false)
+#define VIXL_THROW_IN_NEGATIVE_TESTING_MODE(error) throw(error)
+#else
+#define VIXL_ABORT()                                         \
+  do {                                                       \
+    printf("Aborting in %s, line %i\n", __FILE__, __LINE__); \
+    abort();                                                 \
+  } while (false)
+#define VIXL_ABORT_WITH_MSG(msg)                             \
+  do {                                                       \
+    printf("%sin %s, line %i\n", (msg), __FILE__, __LINE__); \
+    abort();                                                 \
+  } while (false)
+#define VIXL_CHECK(condition)                                       \
+  do {                                                              \
+    if (!(condition)) {                                             \
+      printf("Assertion failed (" #condition ")\nin %s, line %i\n", \
+             __FILE__,                                              \
+             __LINE__);                                             \
+      abort();                                                      \
+    }                                                               \
+  } while (false)
+#define VIXL_THROW_IN_NEGATIVE_TESTING_MODE(error)
+#endif
 #ifdef VIXL_DEBUG
 #define VIXL_ASSERT(condition) assert(condition)
-#define VIXL_CHECK(condition) VIXL_ASSERT(condition)
-#define VIXL_UNIMPLEMENTED()            \
-  do {                                  \
-    fprintf(stderr, "UNIMPLEMENTED\t"); \
-    VIXL_ABORT();                       \
+#define VIXL_UNIMPLEMENTED()               \
+  do {                                     \
+    VIXL_ABORT_WITH_MSG("UNIMPLEMENTED "); \
   } while (false)
-#define VIXL_UNREACHABLE()            \
-  do {                                \
-    fprintf(stderr, "UNREACHABLE\t"); \
-    VIXL_ABORT();                     \
+#define VIXL_UNREACHABLE()               \
+  do {                                   \
+    VIXL_ABORT_WITH_MSG("UNREACHABLE "); \
   } while (false)
 #else
 #define VIXL_ASSERT(condition) ((void)0)
-#define VIXL_CHECK(condition) assert(condition)
 #define VIXL_UNIMPLEMENTED() ((void)0)
 #define VIXL_UNREACHABLE() ((void)0)
 #endif
@@ -148,7 +193,7 @@ inline void USE(const T1&, const T2&, const T3&, const T4&) {}
 // Note: This option is only available for Clang. And will only be enabled for
 // C++11(201103L).
 #if __has_warning("-Wimplicit-fallthrough") && __cplusplus >= 201103L
-#define VIXL_FALLTHROUGH() [[clang::fallthrough]]  // NOLINT
+#define VIXL_FALLTHROUGH() [[clang::fallthrough]]
 #else
 #define VIXL_FALLTHROUGH() \
   do {                     \
@@ -156,7 +201,7 @@ inline void USE(const T1&, const T2&, const T3&, const T4&) {}
 #endif
 
 #if __cplusplus >= 201103L
-#define VIXL_NO_RETURN [[noreturn]]  // NOLINT
+#define VIXL_NO_RETURN [[noreturn]]
 #else
 #define VIXL_NO_RETURN __attribute__((noreturn))
 #endif
@@ -164,6 +209,12 @@ inline void USE(const T1&, const T2&, const T3&, const T4&) {}
 #define VIXL_NO_RETURN_IN_DEBUG_MODE VIXL_NO_RETURN
 #else
 #define VIXL_NO_RETURN_IN_DEBUG_MODE
+#endif
+
+#if __cplusplus >= 201103L
+#define VIXL_OVERRIDE override
+#else
+#define VIXL_OVERRIDE
 #endif
 
 // Some functions might only be marked as "noreturn" for the DEBUG build. This

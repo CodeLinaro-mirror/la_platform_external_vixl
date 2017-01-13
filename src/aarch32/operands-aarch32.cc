@@ -35,12 +35,12 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>  // NOLINT
+#include <iostream>
 
 #include "utils-vixl.h"
 #include "aarch32/constants-aarch32.h"
 #include "aarch32/instructions-aarch32.h"
-#include "aarch32/operand-aarch32.h"
+#include "aarch32/operands-aarch32.h"
 
 namespace vixl {
 namespace aarch32 {

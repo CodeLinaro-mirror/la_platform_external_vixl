@@ -28,15 +28,19 @@
 #ifndef VIXL_AARCH32_MACRO_ASSEMBLER_AARCH32_H_
 #define VIXL_AARCH32_MACRO_ASSEMBLER_AARCH32_H_
 
+#include "code-generation-scopes-vixl.h"
+#include "macro-assembler-interface.h"
 #include "utils-vixl.h"
+
 #include "aarch32/instructions-aarch32.h"
 #include "aarch32/assembler-aarch32.h"
-#include "aarch32/operand-aarch32.h"
+#include "aarch32/operands-aarch32.h"
 
 namespace vixl {
 namespace aarch32 {
 
 class JumpTableBase;
+class UseScratchRegisterScope;
 
 enum FlagsUpdate { LeaveFlags = 0, SetFlags = 1, DontCare = 2 };
 
@@ -60,12 +64,16 @@ class LiteralPool {
   unsigned GetSize() const { return size_; }
 
   // Add a literal to the literal container.
-  uint32_t AddLiteral(RawLiteral* literal) {
-    uint32_t position = GetSize();
-    literal->SetPositionInPool(position);
-    literals_.push_back(literal);
-    size_ += literal->GetAlignedSize();
-    return position;
+  void AddLiteral(RawLiteral* literal) {
+    // Manually placed literals can't be added to a literal pool.
+    VIXL_ASSERT(!literal->IsManuallyPlaced());
+    VIXL_ASSERT(!literal->IsBound());
+    if (literal->GetPositionInPool() == Label::kMaxOffset) {
+      uint32_t position = GetSize();
+      literal->SetPositionInPool(position);
+      literals_.push_back(literal);
+      size_ += literal->GetAlignedSize();
+    }
   }
 
   // First literal to be emitted.
@@ -106,32 +114,40 @@ class LiteralPool {
   std::list<RawLiteral*> keep_until_delete_;
 };
 
+
 // Macro assembler for aarch32 instruction set.
-class MacroAssembler : public Assembler {
+class MacroAssembler : public Assembler, public MacroAssemblerInterface {
  public:
   enum EmitOption { kBranchRequired, kNoBranchRequired };
 
- private:
-  class AllowAssemblerEmissionScope {
-    MacroAssembler* masm_;
+  virtual internal::AssemblerBase* AsAssemblerBase() VIXL_OVERRIDE {
+    return this;
+  }
 
+  virtual void BlockPools() VIXL_OVERRIDE {
+    literal_pool_manager_.Block();
+    veneer_pool_manager_.Block();
+  }
+  virtual void ReleasePools() VIXL_OVERRIDE {
+    literal_pool_manager_.Release();
+    veneer_pool_manager_.Release();
+  }
+  virtual void EnsureEmitPoolsFor(size_t size) VIXL_OVERRIDE {
+    // TODO: Optimise this. It also checks that there is space in the buffer,
+    // which we do not need to do here.
+    VIXL_ASSERT(IsUint32(size));
+    EnsureEmitFor(static_cast<uint32_t>(size));
+  }
+
+ private:
+  class MacroEmissionCheckScope : public EmissionCheckScope {
    public:
-    AllowAssemblerEmissionScope(MacroAssembler* masm, uint32_t size)
-        : masm_(masm) {
-      VIXL_ASSERT(!masm->AllowAssembler());
-      masm->EnsureEmitFor(size);
-#ifdef VIXL_DEBUG
-      masm->SetAllowAssembler(true);
-#else
-      USE(masm_);
-#endif
-    }
-    ~AllowAssemblerEmissionScope() {
-#ifdef VIXL_DEBUG
-      VIXL_ASSERT(masm_->AllowAssembler());
-      masm_->SetAllowAssembler(false);
-#endif
-    }
+    explicit MacroEmissionCheckScope(MacroAssemblerInterface* masm)
+        : EmissionCheckScope(masm, kTypicalMacroInstructionMaxSize) {}
+
+   private:
+    static const size_t kTypicalMacroInstructionMaxSize =
+        8 * kMaxInstructionSizeInBytes;
   };
 
   class MacroAssemblerContext {
@@ -139,9 +155,19 @@ class MacroAssembler : public Assembler {
     MacroAssemblerContext() : count_(0) {}
     ~MacroAssemblerContext() {}
     unsigned GetRecursiveCount() const { return count_; }
-    void Up() {
+    void Up(const char* loc) {
+      location_stack_[count_] = loc;
       count_++;
-      VIXL_CHECK(count_ < kMaxRecursion);
+      if (count_ >= kMaxRecursion) {
+        printf(
+            "Recursion limit reached; unable to resolve macro assembler "
+            "call.\n");
+        printf("Macro assembler context stack:\n");
+        for (unsigned i = 0; i < kMaxRecursion; i++) {
+          printf("%10s %s\n", (i == 0) ? "oldest -> " : "", location_stack_[i]);
+        }
+        VIXL_ABORT();
+      }
     }
     void Down() {
       VIXL_ASSERT((count_ > 0) && (count_ < kMaxRecursion));
@@ -150,14 +176,19 @@ class MacroAssembler : public Assembler {
 
    private:
     unsigned count_;
-    static const uint32_t kMaxRecursion = 5;
+    static const uint32_t kMaxRecursion = 6;
+    const char* location_stack_[kMaxRecursion];
   };
 
+  // This scope is used at each Delegate entry to avoid infinite recursion of
+  // Delegate calls. The limit is defined by
+  // MacroAssemblerContext::kMaxRecursion.
   class ContextScope {
    public:
-    explicit ContextScope(MacroAssembler* const masm) : masm_(masm) {
+    explicit ContextScope(MacroAssembler* const masm, const char* loc)
+        : masm_(masm) {
       VIXL_ASSERT(masm_->AllowMacroInstructions());
-      masm_->GetContext()->Up();
+      masm_->GetContext()->Up(loc);
     }
     ~ContextScope() { masm_->GetContext()->Down(); }
 
@@ -179,8 +210,9 @@ class MacroAssembler : public Assembler {
         } else {
           // The usage of IT is deprecated for the instruction.
           // We generate a conditional branch and an unconditional instruction.
-          masm_->EnsureEmitFor(k16BitT32InstructionSizeInBytes +
-                               kMaxT32MacroInstructionSizeInBytes);
+          // TODO: Use a scope utility with a size check. To do that, we'd need
+          // one with Open() and Close() implemented.
+          masm_->EnsureEmitFor(kMaxT32MacroInstructionSizeInBytes);
           // Generate the branch.
           masm_->b(cond_.Negate(), Narrow, &label_);
           // Tell the macro-assembler to generate unconditional instructions.
@@ -194,10 +226,22 @@ class MacroAssembler : public Assembler {
 #endif
     }
     ~ITScope() {
-      if (!cond_.Is(al) && masm_->IsUsingT32() && !can_use_it_) {
+      if (label_.IsReferenced()) {
+        // We only use the label for conditional T32 instructions for which we
+        // cannot use IT.
+        VIXL_ASSERT(!cond_.Is(al));
+        VIXL_ASSERT(masm_->IsUsingT32());
+        VIXL_ASSERT(!can_use_it_);
         VIXL_ASSERT(masm_->GetCursorOffset() - initial_cursor_offset_ <=
                     kMaxT32MacroInstructionSizeInBytes);
-        masm_->bind(&label_);
+        masm_->BindHelper(&label_);
+      } else if (masm_->IsUsingT32() && !cond_.Is(al)) {
+        // If we've generated a conditional T32 instruction but haven't used the
+        // label, we must have used IT. Check that we did not generate a
+        // deprecated sequence.
+        VIXL_ASSERT(can_use_it_);
+        VIXL_ASSERT(masm_->GetCursorOffset() - initial_cursor_offset_ <=
+                    k16BitT32InstructionSizeInBytes);
       }
     }
 
@@ -212,14 +256,14 @@ class MacroAssembler : public Assembler {
   template <Assembler::InstructionCondDtDL asmfn>
   class EmitLiteralCondDtDL {
    public:
-    EmitLiteralCondDtDL(Condition cond, DataType dt, DRegister rt)
-        : cond_(cond), dt_(dt), rt_(rt) {}
-    void emit(MacroAssembler* const masm, RawLiteral* const literal) {
-      (masm->*asmfn)(cond_, dt_, rt_, literal);
+    EmitLiteralCondDtDL(DataType dt, DRegister rt) : dt_(dt), rt_(rt) {}
+    void emit(MacroAssembler* const masm,
+              Condition cond,
+              RawLiteral* const literal) {
+      (masm->*asmfn)(cond, dt_, rt_, literal);
     }
 
    private:
-    Condition cond_;
     DataType dt_;
     DRegister rt_;
   };
@@ -227,14 +271,14 @@ class MacroAssembler : public Assembler {
   template <Assembler::InstructionCondDtSL asmfn>
   class EmitLiteralCondDtSL {
    public:
-    EmitLiteralCondDtSL(Condition cond, DataType dt, SRegister rt)
-        : cond_(cond), dt_(dt), rt_(rt) {}
-    void emit(MacroAssembler* const masm, RawLiteral* const literal) {
-      (masm->*asmfn)(cond_, dt_, rt_, literal);
+    EmitLiteralCondDtSL(DataType dt, SRegister rt) : dt_(dt), rt_(rt) {}
+    void emit(MacroAssembler* const masm,
+              Condition cond,
+              RawLiteral* const literal) {
+      (masm->*asmfn)(cond, dt_, rt_, literal);
     }
 
    private:
-    Condition cond_;
     DataType dt_;
     SRegister rt_;
   };
@@ -242,33 +286,35 @@ class MacroAssembler : public Assembler {
   template <Assembler::InstructionCondRL asmfn>
   class EmitLiteralCondRL {
    public:
-    EmitLiteralCondRL(Condition cond, Register rt) : cond_(cond), rt_(rt) {}
-    void emit(MacroAssembler* const masm, RawLiteral* const literal) {
-      (masm->*asmfn)(cond_, rt_, literal);
+    explicit EmitLiteralCondRL(Register rt) : rt_(rt) {}
+    void emit(MacroAssembler* const masm,
+              Condition cond,
+              RawLiteral* const literal) {
+      (masm->*asmfn)(cond, rt_, literal);
     }
 
    private:
-    Condition cond_;
     Register rt_;
   };
 
   template <Assembler::InstructionCondRRL asmfn>
   class EmitLiteralCondRRL {
    public:
-    EmitLiteralCondRRL(Condition cond, Register rt, Register rt2)
-        : cond_(cond), rt_(rt), rt2_(rt2) {}
-    void emit(MacroAssembler* const masm, RawLiteral* const literal) {
-      (masm->*asmfn)(cond_, rt_, rt2_, literal);
+    EmitLiteralCondRRL(Register rt, Register rt2) : rt_(rt), rt2_(rt2) {}
+    void emit(MacroAssembler* const masm,
+              Condition cond,
+              RawLiteral* const literal) {
+      (masm->*asmfn)(cond, rt_, rt2_, literal);
     }
 
    private:
-    Condition cond_;
     Register rt_, rt2_;
   };
 
   class LiteralPoolManager {
    public:
-    explicit LiteralPoolManager(MacroAssembler* const masm) : masm_(masm) {
+    explicit LiteralPoolManager(MacroAssembler* const masm)
+        : masm_(masm), monitor_(0) {
       ResetCheckpoint();
     }
 
@@ -283,12 +329,46 @@ class MacroAssembler : public Assembler {
 
     // Checks if the insertion of the literal will put the forward reference
     // too far in the literal pool.
-    bool IsInsertTooFar(RawLiteral* literal, uint32_t from) const {
-      uint32_t checkpoint = from + literal->GetLastInsertForwardDistance();
-      checkpoint =
-          std::min(checkpoint, static_cast<uint32_t>(literal->GetCheckpoint()));
-      bool too_far = AlignDown(checkpoint, 4) < from + literal_pool_.GetSize() +
-                                                    kMaxInstructionSizeInBytes;
+    // This function is called after generating an instruction with a literal.
+    // We want to know if the literal can be reached by the instruction.
+    // If not, we will unwind the instruction, generate the pool (without the
+    // last literal) and generate the instruction again.
+    // "literal" is the literal we want to insert into the pool.
+    // "from" is the location where the instruction which uses the literal has
+    // been generated.
+    bool WasInsertedTooFar(RawLiteral* literal) const {
+      // Last accessible location for the instruction we just generated, which
+      // uses the literal.
+      Label::ForwardReference& reference = literal->GetBackForwardRef();
+      Label::Offset new_checkpoint = AlignDown(reference.GetCheckpoint(), 4);
+
+      // TODO: We should not need to get the min of new_checkpoint and the
+      // existing checkpoint. The existing checkpoint should already have
+      // been checked when reserving space for this load literal instruction.
+      // The assertion below asserts that we don't need the min operation here.
+      Label::Offset checkpoint =
+          std::min(new_checkpoint, literal->GetAlignedCheckpoint(4));
+      bool literal_in_pool =
+          (literal->GetPositionInPool() != Label::kMaxOffset);
+      Label::Offset position_in_pool = literal_in_pool
+                                           ? literal->GetPositionInPool()
+                                           : literal_pool_.GetSize();
+      // Compare the checkpoint to the location where the literal should be
+      // added.
+      // We add space for two instructions: one branch and one potential veneer
+      // which may be added after the check. In this particular use case, no
+      // veneer can be added but, this way, we are consistent with all the
+      // literal pool checks.
+      int32_t from =
+          reference.GetLocation() + masm_->GetArchitectureStatePCOffset();
+      bool too_far =
+          checkpoint < from + position_in_pool +
+                           2 * static_cast<int32_t>(kMaxInstructionSizeInBytes);
+      // Assert if the literal is already in the pool and the existing
+      // checkpoint triggers a rewind here, as this means the pool should
+      // already have been emitted (perhaps we have not reserved enough space
+      // for the instruction we are about to rewind).
+      VIXL_ASSERT(!(too_far && (literal->GetCheckpoint() < new_checkpoint)));
       return too_far;
     }
 
@@ -307,8 +387,17 @@ class MacroAssembler : public Assembler {
       }
     }
 
-    // Inserts the literal in the pool, and update the different checkpoints.
-    void AddLiteral(RawLiteral* literal) { literal_pool_.AddLiteral(literal); }
+    bool IsEmpty() const { return GetLiteralPoolSize() == 0; }
+
+    void Block() { monitor_++; }
+    void Release() {
+      VIXL_ASSERT(IsBlocked());
+      if (--monitor_ == 0) {
+        // Ensure the pool has not been blocked for too long.
+        VIXL_ASSERT(masm_->GetCursorOffset() <= checkpoint_);
+      }
+    }
+    bool IsBlocked() const { return monitor_ != 0; }
 
    private:
     MacroAssembler* const masm_;
@@ -318,87 +407,63 @@ class MacroAssembler : public Assembler {
     // emitted. A default value of Label::kMaxOffset means that the checkpoint
     // is invalid.
     Label::Offset checkpoint_;
-  };
-
-  class VeneerPoolManager {
-   public:
-    explicit VeneerPoolManager(MacroAssembler* masm)
-        : masm_(masm), checkpoint_(Label::kMaxOffset) {}
-    Label::Offset GetCheckpoint() const {
-      // Make room for a branch over the pools.
-      return checkpoint_ - kMaxInstructionSizeInBytes;
-    }
-    size_t GetMaxSize() const {
-      return labels_.size() * kMaxInstructionSizeInBytes;
-    }
-    void AddLabel(Label* label) {
-      if (!label->IsInVeneerPool()) {
-        label->SetInVeneerPool();
-        labels_.push_back(label);
-      }
-      Label::ForwardReference& back = label->GetBackForwardRef();
-      back.SetIsBranch();
-      label->UpdateCheckpoint();
-      Label::Offset tmp = label->GetCheckpoint();
-      if (checkpoint_ > tmp) {
-        checkpoint_ = tmp;
-        masm_->ComputeCheckpoint();
-      }
-    }
-    void RemoveLabel(Label* label);
-    void Emit(Label::Offset target);
-
-   private:
-    MacroAssembler* masm_;
-    // List of all unbound labels which are used by a branch instruction.
-    std::list<Label*> labels_;
-    // Max offset in the code buffer where the veneer needs to be emitted.
-    // A default value of Label::kMaxOffset means that the checkpoint is
-    // invalid.
-    Label::Offset checkpoint_;
+    // Indicates whether the emission of this pool is blocked.
+    int monitor_;
   };
 
   void PerformEnsureEmit(Label::Offset target, uint32_t extra_size);
 
  protected:
   void HandleOutOfBoundsImmediate(Condition cond, Register tmp, uint32_t imm);
+  void PadToMinimumBranchRange(Label* label);
 
   // Generate the instruction and if it's not possible revert the whole thing.
   // emit the literal pool and regenerate the instruction.
   // Note: The instruction is generated via
   // void T::emit(MacroAssembler* const, RawLiteral* const)
   template <typename T>
-  void GenerateInstruction(T instr_callback, RawLiteral* const literal) {
-    ptrdiff_t cursor = GetBuffer().GetCursorOffset();
-    uint32_t where = cursor + GetArchitectureStatePCOffset();
+  void GenerateInstruction(Condition cond,
+                           T instr_callback,
+                           RawLiteral* const literal) {
+    int32_t cursor = GetCursorOffset();
     // Emit the instruction, via the assembler
     {
-      AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-      instr_callback.emit(this, literal);
+      MacroEmissionCheckScope guard(this);
+      // The ITScope can change the condition and we want to be able to revert
+      // this.
+      Condition c(cond);
+      ITScope it_scope(this, &c);
+      instr_callback.emit(this, c, literal);
     }
-    if (IsInsertTooFar(literal, where)) {
-      // The instruction's data is too far: revert the emission
-      GetBuffer().Rewind(cursor);
-      literal->InvalidateLastForwardReference(RawLiteral::kNoUpdateNecessary);
-      EmitLiteralPool(kBranchRequired);
-      AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-      instr_callback.emit(this, literal);
+    if (!literal->IsManuallyPlaced() && !literal->IsBound()) {
+      if (WasInsertedTooFar(literal)) {
+        // The instruction's data is too far: revert the emission
+        GetBuffer()->Rewind(cursor);
+        literal->InvalidateLastForwardReference(RawLiteral::kNoUpdateNecessary);
+        EmitLiteralPool(kBranchRequired);
+        MacroEmissionCheckScope guard(this);
+        ITScope it_scope(this, &cond);
+        instr_callback.emit(this, cond, literal);
+      }
+      // The literal pool above might have included the literal - in which
+      // case it will now be bound.
+      if (!literal->IsBound()) {
+        literal_pool_manager_.GetLiteralPool()->AddLiteral(literal);
+        literal_pool_manager_.UpdateCheckpoint(literal);
+      }
     }
-    if (literal->GetPositionInPool() == Label::kMaxOffset) {
-      literal_pool_manager_.AddLiteral(literal);
-    }
-    literal_pool_manager_.UpdateCheckpoint(literal);
   }
 
  public:
   explicit MacroAssembler(InstructionSet isa = A32)
       : Assembler(isa),
         available_(r12),
+        current_scratch_scope_(NULL),
         checkpoint_(Label::kMaxOffset),
         literal_pool_manager_(this),
         veneer_pool_manager_(this),
-        generate_simulator_code_(VIXL_AARCH32_GENERATE_SIMULATOR_CODE) {
-    SetAllowAssembler(false);
+        generate_simulator_code_(VIXL_AARCH32_GENERATE_SIMULATOR_CODE),
+        doing_veneer_pool_generation_(false) {
 #ifdef VIXL_DEBUG
     SetAllowMacroInstructions(true);
 #else
@@ -410,24 +475,26 @@ class MacroAssembler : public Assembler {
   explicit MacroAssembler(size_t size, InstructionSet isa = A32)
       : Assembler(size, isa),
         available_(r12),
+        current_scratch_scope_(NULL),
         checkpoint_(Label::kMaxOffset),
         literal_pool_manager_(this),
         veneer_pool_manager_(this),
-        generate_simulator_code_(VIXL_AARCH32_GENERATE_SIMULATOR_CODE) {
-    SetAllowAssembler(false);
+        generate_simulator_code_(VIXL_AARCH32_GENERATE_SIMULATOR_CODE),
+        doing_veneer_pool_generation_(false) {
 #ifdef VIXL_DEBUG
     SetAllowMacroInstructions(true);
 #endif
     ComputeCheckpoint();
   }
-  MacroAssembler(void* buffer, size_t size, InstructionSet isa = A32)
+  MacroAssembler(byte* buffer, size_t size, InstructionSet isa = A32)
       : Assembler(buffer, size, isa),
         available_(r12),
+        current_scratch_scope_(NULL),
         checkpoint_(Label::kMaxOffset),
         literal_pool_manager_(this),
         veneer_pool_manager_(this),
-        generate_simulator_code_(VIXL_AARCH32_GENERATE_SIMULATOR_CODE) {
-    SetAllowAssembler(false);
+        generate_simulator_code_(VIXL_AARCH32_GENERATE_SIMULATOR_CODE),
+        doing_veneer_pool_generation_(false) {
 #ifdef VIXL_DEBUG
     SetAllowMacroInstructions(true);
 #endif
@@ -436,15 +503,15 @@ class MacroAssembler : public Assembler {
 
   bool GenerateSimulatorCode() const { return generate_simulator_code_; }
 
-#ifdef VIXL_DEBUG
   // Tell whether any of the macro instruction can be used. When false the
   // MacroAssembler will assert if a method which can emit a variable number
   // of instructions is called.
-  void SetAllowMacroInstructions(bool value) {
+  virtual void SetAllowMacroInstructions(bool value) VIXL_OVERRIDE {
     allow_macro_instructions_ = value;
   }
-  bool AllowMacroInstructions() const { return allow_macro_instructions_; }
-#endif
+  virtual bool AllowMacroInstructions() const VIXL_OVERRIDE {
+    return allow_macro_instructions_;
+  }
 
   void FinalizeCode() {
     EmitLiteralPool(kNoBranchRequired);
@@ -454,16 +521,77 @@ class MacroAssembler : public Assembler {
   RegisterList* GetScratchRegisterList() { return &available_; }
   VRegisterList* GetScratchVRegisterList() { return &available_vfp_; }
 
+  // Get or set the current (most-deeply-nested) UseScratchRegisterScope.
+  void SetCurrentScratchRegisterScope(UseScratchRegisterScope* scope) {
+    current_scratch_scope_ = scope;
+  }
+  UseScratchRegisterScope* GetCurrentScratchRegisterScope() {
+    return current_scratch_scope_;
+  }
+
+  // Given an address calculation (Register + immediate), generate code to
+  // partially compute the address. The returned MemOperand will perform any
+  // remaining computation in a subsequent load or store instruction.
+  //
+  // The offset provided should be the offset that would be used in a load or
+  // store instruction (if it had sufficient range). This only matters where
+  // base.Is(pc), since load and store instructions align the pc before
+  // dereferencing it.
+  //
+  // TODO: Improve the handling of negative offsets. They are not implemented
+  // precisely for now because they only have a marginal benefit for the
+  // existing uses (in delegates).
+  MemOperand MemOperandComputationHelper(Condition cond,
+                                         Register scratch,
+                                         Register base,
+                                         uint32_t offset,
+                                         uint32_t extra_offset_mask = 0);
+
+  MemOperand MemOperandComputationHelper(Register scratch,
+                                         Register base,
+                                         uint32_t offset,
+                                         uint32_t extra_offset_mask = 0) {
+    return MemOperandComputationHelper(al,
+                                       scratch,
+                                       base,
+                                       offset,
+                                       extra_offset_mask);
+  }
+  MemOperand MemOperandComputationHelper(Condition cond,
+                                         Register scratch,
+                                         Label* label,
+                                         uint32_t extra_offset_mask = 0) {
+    // Check for buffer space _before_ calculating the offset, in case we
+    // generate a pool that affects the offset calculation.
+    CodeBufferCheckScope scope(this, 4 * kMaxInstructionSizeInBytes);
+    Label::Offset offset =
+        label->GetLocation() -
+        AlignDown(GetCursorOffset() + GetArchitectureStatePCOffset(), 4);
+    return MemOperandComputationHelper(cond,
+                                       scratch,
+                                       pc,
+                                       offset,
+                                       extra_offset_mask);
+  }
+  MemOperand MemOperandComputationHelper(Register scratch,
+                                         Label* label,
+                                         uint32_t extra_offset_mask = 0) {
+    return MemOperandComputationHelper(al, scratch, label, extra_offset_mask);
+  }
+
+  // Determine the appropriate mask to pass into MemOperandComputationHelper.
+  uint32_t GetOffsetMask(InstructionType type, AddrMode addrmode);
+
   // State and type helpers.
   bool IsModifiedImmediate(uint32_t imm) {
-    return (IsUsingT32() && ImmediateT32(imm).IsValid()) ||
-           ImmediateA32(imm).IsValid();
+    return IsUsingT32() ? ImmediateT32::IsImmediateT32(imm)
+                        : ImmediateA32::IsImmediateA32(imm);
   }
 
   void Bind(Label* label) {
     VIXL_ASSERT(allow_macro_instructions_);
-    bind(label);
-    if (label->IsInVeneerPool()) veneer_pool_manager_.RemoveLabel(label);
+    PadToMinimumBranchRange(label);
+    BindHelper(label);
   }
 
   void AddBranchLabel(Label* label) {
@@ -473,91 +601,251 @@ class MacroAssembler : public Assembler {
 
   void Place(RawLiteral* literal) {
     VIXL_ASSERT(allow_macro_instructions_);
-    EnsureEmitFor(literal->GetSize());
-    place(literal);
+    VIXL_ASSERT(literal->IsManuallyPlaced());
+    // We have two calls to `GetBuffer()->Align()` below, that aligns on word
+    // (4 bytes) boundaries. Only one is taken into account in
+    // `GetAlignedSize()`.
+    static const size_t kMaxAlignSize = 3;
+    size_t size = literal->GetAlignedSize() + kMaxAlignSize;
+    VIXL_ASSERT(IsUint32(size));
+    // TODO: We should use a scope here to check the size of data emitted.  We
+    // currently cannot because `aarch32::CodeBufferCheckScope` currently checks
+    // for pools, so that could lead to an infinite loop.
+    EnsureEmitFor(static_cast<uint32_t>(size));
+    // Literals must be emitted aligned on word (4 bytes) boundaries.
+    GetBuffer()->Align();
+    PlaceHelper(literal);
+    GetBuffer()->Align();
   }
 
   void ComputeCheckpoint();
 
+  int32_t GetMarginBeforeVeneerEmission() const {
+    return veneer_pool_manager_.GetCheckpoint() - GetCursorOffset();
+  }
+
+  Label::Offset GetTargetForLiteralEmission() const {
+    if (literal_pool_manager_.IsEmpty()) return Label::kMaxOffset;
+    // We add an instruction to the size as the instruction which calls this
+    // function may add a veneer and, without this extra instruction, could put
+    // the literals out of range. For example, it's the case for a "B"
+    // instruction. At the beginning of the instruction we call EnsureEmitFor
+    // which calls this function. However, the target of the branch hasn't been
+    // inserted yet in the veneer pool.
+    size_t veneer_max_size =
+        veneer_pool_manager_.GetMaxSize() + kMaxInstructionSizeInBytes;
+    VIXL_ASSERT(IsInt32(veneer_max_size));
+    // We must be able to generate the veneer pool first.
+    Label::Offset tmp = literal_pool_manager_.GetCheckpoint() -
+                        static_cast<Label::Offset>(veneer_max_size);
+    VIXL_ASSERT(tmp >= 0);
+    return tmp;
+  }
+
+  int32_t GetMarginBeforeLiteralEmission() const {
+    Label::Offset tmp = GetTargetForLiteralEmission();
+    VIXL_ASSERT(tmp >= GetCursorOffset());
+    return tmp - GetCursorOffset();
+  }
+
+  bool VeneerPoolIsEmpty() const { return veneer_pool_manager_.IsEmpty(); }
+  bool LiteralPoolIsEmpty() const { return literal_pool_manager_.IsEmpty(); }
+
   void EnsureEmitFor(uint32_t size) {
-    Label::Offset target = AlignUp(GetCursorOffset() + size, 4);
-    if (target < checkpoint_) return;
+    Label::Offset target = GetCursorOffset() + size;
+    if (target <= checkpoint_) return;
     PerformEnsureEmit(target, size);
   }
 
-  bool IsInsertTooFar(RawLiteral* literal, uint32_t where) {
-    return literal_pool_manager_.IsInsertTooFar(literal, where);
+  bool WasInsertedTooFar(RawLiteral* literal) {
+    return literal_pool_manager_.WasInsertedTooFar(literal);
+  }
+
+  bool AliasesAvailableScratchRegister(Register reg) {
+    return GetScratchRegisterList()->Includes(reg);
+  }
+
+  bool AliasesAvailableScratchRegister(RegisterOrAPSR_nzcv reg) {
+    if (reg.IsAPSR_nzcv()) return false;
+    return GetScratchRegisterList()->Includes(reg.AsRegister());
+  }
+
+  bool AliasesAvailableScratchRegister(VRegister reg) {
+    return GetScratchVRegisterList()->IncludesAliasOf(reg);
+  }
+
+  bool AliasesAvailableScratchRegister(const Operand& operand) {
+    if (operand.IsImmediate()) return false;
+    return AliasesAvailableScratchRegister(operand.GetBaseRegister()) ||
+           (operand.IsRegisterShiftedRegister() &&
+            AliasesAvailableScratchRegister(operand.GetShiftRegister()));
+  }
+
+  bool AliasesAvailableScratchRegister(const NeonOperand& operand) {
+    if (operand.IsImmediate()) return false;
+    return AliasesAvailableScratchRegister(operand.GetRegister());
+  }
+
+  bool AliasesAvailableScratchRegister(SRegisterList list) {
+    for (int n = 0; n < list.GetLength(); n++) {
+      if (AliasesAvailableScratchRegister(list.GetSRegister(n))) return true;
+    }
+    return false;
+  }
+
+  bool AliasesAvailableScratchRegister(DRegisterList list) {
+    for (int n = 0; n < list.GetLength(); n++) {
+      if (AliasesAvailableScratchRegister(list.GetDRegister(n))) return true;
+    }
+    return false;
+  }
+
+  bool AliasesAvailableScratchRegister(NeonRegisterList list) {
+    for (int n = 0; n < list.GetLength(); n++) {
+      if (AliasesAvailableScratchRegister(list.GetDRegister(n))) return true;
+    }
+    return false;
+  }
+
+  bool AliasesAvailableScratchRegister(RegisterList list) {
+    return GetScratchRegisterList()->Overlaps(list);
+  }
+
+  bool AliasesAvailableScratchRegister(const MemOperand& operand) {
+    return AliasesAvailableScratchRegister(operand.GetBaseRegister()) ||
+           (operand.IsShiftedRegister() &&
+            AliasesAvailableScratchRegister(operand.GetOffsetRegister()));
   }
 
   // Emit the literal pool in the code buffer.
   // Every literal is placed on a 32bit boundary
   // All the literals in the pool will be removed from the pool and potentially
   // delete'd.
-  void EmitLiteralPool(LiteralPool* const literal_pool, EmitOption option) {
-    if (literal_pool->GetSize() > 0) {
-#ifdef VIXL_DEBUG
-      for (LiteralPool::RawLiteralListIterator literal_it =
-               literal_pool->GetFirst();
-           literal_it != literal_pool->GetEnd();
-           literal_it++) {
-        RawLiteral* literal = *literal_it;
-        VIXL_ASSERT(GetCursorOffset() <
-                    static_cast<uint32_t>(literal->GetCheckpoint()));
-      }
-#endif
-      Label after_literal;
-      if (option == kBranchRequired) {
-        GetBuffer().EnsureSpaceFor(kMaxInstructionSizeInBytes);
-        VIXL_ASSERT(!AllowAssembler());
-#ifdef VIXL_DEBUG
-        SetAllowAssembler(true);
-#endif
-        b(&after_literal);
-        VIXL_ASSERT(AllowAssembler());
-#ifdef VIXL_DEBUG
-        SetAllowAssembler(false);
-#endif
-      }
-      GetBuffer().Align();
-      GetBuffer().EnsureSpaceFor(literal_pool->GetSize());
-      for (LiteralPool::RawLiteralListIterator it = literal_pool->GetFirst();
-           it != literal_pool->GetEnd();
-           it++) {
-        place(*it);
-      }
-      if (option == kBranchRequired) bind(&after_literal);
-      literal_pool->Clear();
-    }
-  }
+  void EmitLiteralPool(LiteralPool* const literal_pool, EmitOption option);
   void EmitLiteralPool(EmitOption option = kBranchRequired) {
+    VIXL_ASSERT(!literal_pool_manager_.IsBlocked());
     EmitLiteralPool(literal_pool_manager_.GetLiteralPool(), option);
     literal_pool_manager_.ResetCheckpoint();
     ComputeCheckpoint();
   }
 
-  unsigned GetLiteralPoolSize() const {
+  size_t GetLiteralPoolSize() const {
     return literal_pool_manager_.GetLiteralPoolSize();
   }
 
-  // Add a Literal to the internal literal pool
-  void AddLiteral(RawLiteral* literal) {
-    return literal_pool_manager_.AddLiteral(literal);
+  // Adr with a literal already constructed. Add the literal to the pool if it
+  // is not already done.
+  void Adr(Condition cond, Register rd, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondRL<&Assembler::adr> emit_helper(rd);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Adr(Register rd, RawLiteral* literal) { Adr(al, rd, literal); }
+
+  // Loads with literals already constructed. Add the literal to the pool
+  // if it is not already done.
+  void Ldr(Condition cond, Register rt, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondRL<&Assembler::ldr> emit_helper(rt);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Ldr(Register rt, RawLiteral* literal) { Ldr(al, rt, literal); }
+
+  void Ldrb(Condition cond, Register rt, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondRL<&Assembler::ldrb> emit_helper(rt);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Ldrb(Register rt, RawLiteral* literal) { Ldrb(al, rt, literal); }
+
+  void Ldrd(Condition cond, Register rt, Register rt2, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondRRL<&Assembler::ldrd> emit_helper(rt, rt2);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Ldrd(Register rt, Register rt2, RawLiteral* literal) {
+    Ldrd(al, rt, rt2, literal);
+  }
+
+  void Ldrh(Condition cond, Register rt, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondRL<&Assembler::ldrh> emit_helper(rt);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Ldrh(Register rt, RawLiteral* literal) { Ldrh(al, rt, literal); }
+
+  void Ldrsb(Condition cond, Register rt, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondRL<&Assembler::ldrsb> emit_helper(rt);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Ldrsb(Register rt, RawLiteral* literal) { Ldrsb(al, rt, literal); }
+
+  void Ldrsh(Condition cond, Register rt, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondRL<&Assembler::ldrsh> emit_helper(rt);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Ldrsh(Register rt, RawLiteral* literal) { Ldrsh(al, rt, literal); }
+
+  void Vldr(Condition cond, DataType dt, DRegister rd, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondDtDL<&Assembler::vldr> emit_helper(dt, rd);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Vldr(DataType dt, DRegister rd, RawLiteral* literal) {
+    Vldr(al, dt, rd, literal);
+  }
+  void Vldr(Condition cond, DRegister rd, RawLiteral* literal) {
+    Vldr(cond, Untyped64, rd, literal);
+  }
+  void Vldr(DRegister rd, RawLiteral* literal) {
+    Vldr(al, Untyped64, rd, literal);
+  }
+
+  void Vldr(Condition cond, DataType dt, SRegister rd, RawLiteral* literal) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
+    EmitLiteralCondDtSL<&Assembler::vldr> emit_helper(dt, rd);
+    GenerateInstruction(cond, emit_helper, literal);
+  }
+  void Vldr(DataType dt, SRegister rd, RawLiteral* literal) {
+    Vldr(al, dt, rd, literal);
+  }
+  void Vldr(Condition cond, SRegister rd, RawLiteral* literal) {
+    Vldr(cond, Untyped32, rd, literal);
+  }
+  void Vldr(SRegister rd, RawLiteral* literal) {
+    Vldr(al, Untyped32, rd, literal);
   }
 
   // Generic Ldr(register, data)
   void Ldr(Condition cond, Register rt, uint32_t v) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
     RawLiteral* literal =
         new Literal<uint32_t>(v, RawLiteral::kDeletedOnPlacementByPool);
-    EmitLiteralCondRL<&Assembler::ldr> emit_helper(cond, rt);
-    GenerateInstruction(emit_helper, literal);
-  }
-  // Ldr string pointer. The string is added to the literal pool and the
-  // string's address in the literal pool is loaded in rt (adr instruction).
-  void Ldr(Condition cond, Register rt, const char* str) {
-    RawLiteral* literal =
-        new Literal<const char*>(str, RawLiteral::kDeletedOnPlacementByPool);
-    EmitLiteralCondRL<&Assembler::adr> emit_helper(cond, rt);
-    GenerateInstruction(emit_helper, literal);
+    EmitLiteralCondRL<&Assembler::ldr> emit_helper(rt);
+    GenerateInstruction(cond, emit_helper, literal);
   }
   template <typename T>
   void Ldr(Register rt, T v) {
@@ -566,31 +854,41 @@ class MacroAssembler : public Assembler {
 
   // Generic Ldrd(rt, rt2, data)
   void Ldrd(Condition cond, Register rt, Register rt2, uint64_t v) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
     RawLiteral* literal =
         new Literal<uint64_t>(v, RawLiteral::kDeletedOnPlacementByPool);
-    EmitLiteralCondRRL<&Assembler::ldrd> emit_helper(cond, rt, rt2);
-    GenerateInstruction(emit_helper, literal);
+    EmitLiteralCondRRL<&Assembler::ldrd> emit_helper(rt, rt2);
+    GenerateInstruction(cond, emit_helper, literal);
   }
   template <typename T>
   void Ldrd(Register rt, Register rt2, T v) {
     Ldrd(al, rt, rt2, v);
   }
 
-  void Vldr(Condition cond, SRegister rt, float v) {
+  void Vldr(Condition cond, SRegister rd, float v) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
     RawLiteral* literal =
         new Literal<float>(v, RawLiteral::kDeletedOnPlacementByPool);
-    EmitLiteralCondDtSL<&Assembler::vldr> emit_helper(cond, Untyped32, rt);
-    GenerateInstruction(emit_helper, literal);
+    EmitLiteralCondDtSL<&Assembler::vldr> emit_helper(Untyped32, rd);
+    GenerateInstruction(cond, emit_helper, literal);
   }
-  void Vldr(SRegister rt, float v) { Vldr(al, rt, v); }
+  void Vldr(SRegister rd, float v) { Vldr(al, rd, v); }
 
-  void Vldr(Condition cond, DRegister rt, double v) {
+  void Vldr(Condition cond, DRegister rd, double v) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(allow_macro_instructions_);
+    VIXL_ASSERT(OutsideITBlock());
     RawLiteral* literal =
         new Literal<double>(v, RawLiteral::kDeletedOnPlacementByPool);
-    EmitLiteralCondDtDL<&Assembler::vldr> emit_helper(cond, Untyped64, rt);
-    GenerateInstruction(emit_helper, literal);
+    EmitLiteralCondDtDL<&Assembler::vldr> emit_helper(Untyped64, rd);
+    GenerateInstruction(cond, emit_helper, literal);
   }
-  void Vldr(DRegister rt, double v) { Vldr(al, rt, v); }
+  void Vldr(DRegister rd, double v) { Vldr(al, rd, v); }
 
   void Vmov(Condition cond, DRegister rt, double v) { Vmov(cond, F64, rt, v); }
   void Vmov(DRegister rt, double v) { Vmov(al, F64, rt, v); }
@@ -649,110 +947,135 @@ class MacroAssembler : public Assembler {
                              int* vfp_count,
                              uint32_t* printf_type);
   // Handlers for cases not handled by the assembler.
+  // ADD, MOVT, MOVW, SUB, SXTB16, TEQ, UXTB16
   virtual void Delegate(InstructionType type,
                         InstructionCondROp instruction,
                         Condition cond,
                         Register rn,
-                        const Operand& operand);
+                        const Operand& operand) VIXL_OVERRIDE;
+  // CMN, CMP, MOV, MOVS, MVN, MVNS, SXTB, SXTH, TST, UXTB, UXTH
   virtual void Delegate(InstructionType type,
                         InstructionCondSizeROp instruction,
                         Condition cond,
                         EncodingSize size,
                         Register rn,
-                        const Operand& operand);
+                        const Operand& operand) VIXL_OVERRIDE;
+  // ADDW, ORN, ORNS, PKHBT, PKHTB, RSC, RSCS, SUBW, SXTAB, SXTAB16, SXTAH,
+  // UXTAB, UXTAB16, UXTAH
   virtual void Delegate(InstructionType type,
                         InstructionCondRROp instruction,
                         Condition cond,
                         Register rd,
                         Register rn,
-                        const Operand& operand);
+                        const Operand& operand) VIXL_OVERRIDE;
+  // ADC, ADCS, ADD, ADDS, AND, ANDS, ASR, ASRS, BIC, BICS, EOR, EORS, LSL,
+  // LSLS, LSR, LSRS, ORR, ORRS, ROR, RORS, RSB, RSBS, SBC, SBCS, SUB, SUBS
+  virtual void Delegate(InstructionType type,
+                        InstructionCondSizeRL instruction,
+                        Condition cond,
+                        EncodingSize size,
+                        Register rd,
+                        Label* label) VIXL_OVERRIDE;
   virtual void Delegate(InstructionType type,
                         InstructionCondSizeRROp instruction,
                         Condition cond,
                         EncodingSize size,
                         Register rd,
                         Register rn,
-                        const Operand& operand);
+                        const Operand& operand) VIXL_OVERRIDE;
+  // CBNZ, CBZ
   virtual void Delegate(InstructionType type,
                         InstructionRL instruction,
                         Register rn,
-                        Label* label);
+                        Label* label) VIXL_OVERRIDE;
+  // VMOV
   virtual void Delegate(InstructionType type,
                         InstructionCondDtSSop instruction,
                         Condition cond,
                         DataType dt,
                         SRegister rd,
-                        const SOperand& operand);
+                        const SOperand& operand) VIXL_OVERRIDE;
+  // VMOV, VMVN
   virtual void Delegate(InstructionType type,
                         InstructionCondDtDDop instruction,
                         Condition cond,
                         DataType dt,
                         DRegister rd,
-                        const DOperand& operand);
+                        const DOperand& operand) VIXL_OVERRIDE;
+  // VMOV, VMVN
   virtual void Delegate(InstructionType type,
                         InstructionCondDtQQop instruction,
                         Condition cond,
                         DataType dt,
                         QRegister rd,
-                        const QOperand& operand);
-  virtual void Delegate(InstructionType type,
-                        InstructionCondMop instruction,
-                        Condition cond,
-                        const MemOperand& operand);
-  virtual void Delegate(InstructionType type,
-                        InstructionCondRMop instruction,
-                        Condition cond,
-                        Register rd,
-                        const MemOperand& operand);
+                        const QOperand& operand) VIXL_OVERRIDE;
+  // LDR, LDRB, LDRH, LDRSB, LDRSH, STR, STRB, STRH
   virtual void Delegate(InstructionType type,
                         InstructionCondSizeRMop instruction,
                         Condition cond,
                         EncodingSize size,
                         Register rd,
-                        const MemOperand& operand);
+                        const MemOperand& operand) VIXL_OVERRIDE;
+  // LDAEXD, LDRD, LDREXD, STLEX, STLEXB, STLEXH, STRD, STREX, STREXB, STREXH
+  virtual void Delegate(InstructionType type,
+                        InstructionCondRL instruction,
+                        Condition cond,
+                        Register rt,
+                        Label* label) VIXL_OVERRIDE;
+  virtual void Delegate(InstructionType type,
+                        InstructionCondRRL instruction,
+                        Condition cond,
+                        Register rt,
+                        Register rt2,
+                        Label* label) VIXL_OVERRIDE;
   virtual void Delegate(InstructionType type,
                         InstructionCondRRMop instruction,
                         Condition cond,
                         Register rt,
                         Register rt2,
-                        const MemOperand& operand);
-  virtual void Delegate(InstructionType type,
-                        InstructionCondRRRMop instruction,
-                        Condition cond,
-                        Register rd,
-                        Register rt,
-                        Register rt2,
-                        const MemOperand& operand);
+                        const MemOperand& operand) VIXL_OVERRIDE;
+  // VLDR, VSTR
   virtual void Delegate(InstructionType type,
                         InstructionCondDtSMop instruction,
                         Condition cond,
                         DataType dt,
                         SRegister rd,
-                        const MemOperand& operand);
+                        const MemOperand& operand) VIXL_OVERRIDE;
+  // VLDR, VSTR
   virtual void Delegate(InstructionType type,
                         InstructionCondDtDMop instruction,
                         Condition cond,
                         DataType dt,
                         DRegister rd,
-                        const MemOperand& operand);
-  virtual void Delegate(InstructionType type,
-                        InstructionCondDtNrlMop instruction,
-                        Condition cond,
-                        DataType dt,
-                        const NeonRegisterList& reglist,
-                        const MemOperand& operand);
+                        const MemOperand& operand) VIXL_OVERRIDE;
+  // MSR
   virtual void Delegate(InstructionType type,
                         InstructionCondMsrOp instruction,
                         Condition cond,
                         MaskedSpecialRegister spec_reg,
-                        const Operand& operand);
+                        const Operand& operand) VIXL_OVERRIDE;
+  virtual void Delegate(InstructionType type,
+                        InstructionCondDtDL instruction,
+                        Condition cond,
+                        DataType dt,
+                        DRegister rd,
+                        Label* label) VIXL_OVERRIDE;
+  virtual void Delegate(InstructionType type,
+                        InstructionCondDtSL instruction,
+                        Condition cond,
+                        DataType dt,
+                        SRegister rd,
+                        Label* label) VIXL_OVERRIDE;
 
   // Start of generated code.
 
   void Adc(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // ADC<c>{<q>} {<Rdn>,} <Rdn>, <Rm> ; T1
         operand.IsPlainRegister() && rn.IsLow() && rd.Is(rn) &&
@@ -776,10 +1099,10 @@ class MacroAssembler : public Assembler {
         Adcs(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rn.Is(rd) && operand.IsPlainRegister() &&
-                                    operand.GetBaseRegister().IsLow();
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rn.Is(rd) && operand.IsPlainRegister() &&
+                                   operand.GetBaseRegister().IsLow();
+        if (setflags_is_smaller) {
           Adcs(cond, rd, rn, operand);
         } else {
           Adc(cond, rd, rn, operand);
@@ -795,9 +1118,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Adcs(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     adcs(cond, rd, rn, operand);
   }
@@ -806,9 +1132,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Add(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     if (cond.Is(al) && rd.Is(rn) && operand.IsImmediate()) {
       uint32_t immediate = operand.GetImmediate();
       if (immediate == 0) {
@@ -823,7 +1152,7 @@ class MacroAssembler : public Assembler {
         (operand.IsImmediate() && (operand.GetImmediate() <= 255) &&
          rd.IsLow() && rn.Is(rd)) ||
         // ADD{<c>}{<q>} <Rd>, SP, #<imm8> ; T1
-        (operand.IsImmediate() && (operand.GetImmediate() <= 508) &&
+        (operand.IsImmediate() && (operand.GetImmediate() <= 1020) &&
          ((operand.GetImmediate() & 0x3) == 0) && rd.IsLow() && rn.IsSP()) ||
         // ADD<c>{<q>} <Rd>, <Rn>, <Rm>
         (operand.IsPlainRegister() && rd.IsLow() && rn.IsLow() &&
@@ -854,19 +1183,27 @@ class MacroAssembler : public Assembler {
         Adds(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded =
+        bool setflags_is_smaller =
             IsUsingT32() && cond.Is(al) &&
-            ((operand.IsPlainRegister() &&
-              ((rd.IsLow() && rn.IsLow() &&
-                operand.GetBaseRegister().IsLow()) ||
-               rd.Is(rn))) ||
+            ((operand.IsPlainRegister() && rd.IsLow() && rn.IsLow() &&
+              !rd.Is(rn) && operand.GetBaseRegister().IsLow()) ||
              (operand.IsImmediate() &&
               ((rd.IsLow() && rn.IsLow() && (operand.GetImmediate() < 8)) ||
                (rd.IsLow() && rn.Is(rd) && (operand.GetImmediate() < 256)))));
-        if (can_be_16bit_encoded) {
+        if (setflags_is_smaller) {
           Adds(cond, rd, rn, operand);
         } else {
-          Add(cond, rd, rn, operand);
+          bool changed_op_is_smaller =
+              operand.IsImmediate() && (operand.GetSignedImmediate() < 0) &&
+              ((rd.IsLow() && rn.IsLow() &&
+                (operand.GetSignedImmediate() >= -7)) ||
+               (rd.IsLow() && rn.Is(rd) &&
+                (operand.GetSignedImmediate() >= -255)));
+          if (changed_op_is_smaller) {
+            Subs(cond, rd, rn, -operand.GetSignedImmediate());
+          } else {
+            Add(cond, rd, rn, operand);
+          }
         }
         break;
     }
@@ -879,9 +1216,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Adds(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     adds(cond, rd, rn, operand);
   }
@@ -889,37 +1229,34 @@ class MacroAssembler : public Assembler {
     Adds(al, rd, rn, operand);
   }
 
-  void Addw(Condition cond, Register rd, Register rn, const Operand& operand) {
-    VIXL_ASSERT(allow_macro_instructions_);
-    VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    ITScope it_scope(this, &cond);
-    addw(cond, rd, rn, operand);
-  }
-  void Addw(Register rd, Register rn, const Operand& operand) {
-    Addw(al, rd, rn, operand);
-  }
-
   void Adr(Condition cond, Register rd, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     adr(cond, rd, label);
   }
   void Adr(Register rd, Label* label) { Adr(al, rd, label); }
 
   void And(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    if (cond.Is(al) && rd.Is(rn) && operand.IsImmediate()) {
+    MacroEmissionCheckScope guard(this);
+    if (rd.Is(rn) && operand.IsPlainRegister() &&
+        rd.Is(operand.GetBaseRegister())) {
+      return;
+    }
+    if (cond.Is(al) && operand.IsImmediate()) {
       uint32_t immediate = operand.GetImmediate();
       if (immediate == 0) {
         mov(rd, 0);
         return;
       }
-      if (immediate == 0xffffffff) {
+      if ((immediate == 0xffffffff) && rd.Is(rn)) {
         return;
       }
     }
@@ -946,10 +1283,14 @@ class MacroAssembler : public Assembler {
         Ands(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rn.Is(rd) && operand.IsPlainRegister() &&
-                                    operand.GetBaseRegister().IsLow();
-        if (can_be_16bit_encoded) {
+        if (operand.IsPlainRegister() && rd.Is(rn) &&
+            rd.Is(operand.GetBaseRegister())) {
+          return;
+        }
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rn.Is(rd) && operand.IsPlainRegister() &&
+                                   operand.GetBaseRegister().IsLow();
+        if (setflags_is_smaller) {
           Ands(cond, rd, rn, operand);
         } else {
           And(cond, rd, rn, operand);
@@ -965,9 +1306,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Ands(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ands(cond, rd, rn, operand);
   }
@@ -976,9 +1320,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Asr(Condition cond, Register rd, Register rm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // ASR<c>{<q>} {<Rd>,} <Rm>, #<imm> ; T2
         (operand.IsImmediate() && (operand.GetImmediate() >= 1) &&
@@ -1005,10 +1352,12 @@ class MacroAssembler : public Assembler {
         Asrs(cond, rd, rm, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rm.IsLow() && operand.IsImmediate() &&
-                                    (operand.GetImmediate() < 32);
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller =
+            IsUsingT32() && cond.Is(al) && rd.IsLow() && rm.IsLow() &&
+            ((operand.IsImmediate() && (operand.GetImmediate() >= 1) &&
+              (operand.GetImmediate() <= 32)) ||
+             (operand.IsPlainRegister() && rd.Is(rm)));
+        if (setflags_is_smaller) {
           Asrs(cond, rd, rm, operand);
         } else {
           Asr(cond, rd, rm, operand);
@@ -1024,9 +1373,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Asrs(Condition cond, Register rd, Register rm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     asrs(cond, rd, rm, operand);
   }
@@ -1034,19 +1386,33 @@ class MacroAssembler : public Assembler {
     Asrs(al, rd, rm, operand);
   }
 
-  void B(Condition cond, Label* label) {
+  void B(Condition cond, Label* label, BranchHint hint = kBranchWithoutHint) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    b(cond, label);
+    MacroEmissionCheckScope guard(this);
+    if (hint == kNear) {
+      if (label->IsBound()) {
+        b(cond, label);
+      } else {
+        b(cond, Narrow, label);
+      }
+    } else {
+      b(cond, label);
+    }
     AddBranchLabel(label);
   }
-  void B(Label* label) { B(al, label); }
+  void B(Label* label, BranchHint hint = kBranchWithoutHint) {
+    B(al, label, hint);
+  }
+  void BPreferNear(Condition cond, Label* label) { B(cond, label, kNear); }
+  void BPreferNear(Label* label) { B(al, label, kNear); }
 
   void Bfc(Condition cond, Register rd, uint32_t lsb, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     bfc(cond, rd, lsb, operand);
   }
@@ -1059,9 +1425,12 @@ class MacroAssembler : public Assembler {
            Register rn,
            uint32_t lsb,
            const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     bfi(cond, rd, rn, lsb, operand);
   }
@@ -1070,12 +1439,15 @@ class MacroAssembler : public Assembler {
   }
 
   void Bic(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    if (cond.Is(al) && rd.Is(rn) && operand.IsImmediate()) {
+    MacroEmissionCheckScope guard(this);
+    if (cond.Is(al) && operand.IsImmediate()) {
       uint32_t immediate = operand.GetImmediate();
-      if (immediate == 0) {
+      if ((immediate == 0) && rd.Is(rn)) {
         return;
       }
       if (immediate == 0xffffffff) {
@@ -1106,10 +1478,10 @@ class MacroAssembler : public Assembler {
         Bics(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rn.Is(rd) && operand.IsPlainRegister() &&
-                                    operand.GetBaseRegister().IsLow();
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rn.Is(rd) && operand.IsPlainRegister() &&
+                                   operand.GetBaseRegister().IsLow();
+        if (setflags_is_smaller) {
           Bics(cond, rd, rn, operand);
         } else {
           Bic(cond, rd, rn, operand);
@@ -1125,9 +1497,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Bics(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     bics(cond, rd, rn, operand);
   }
@@ -1138,7 +1513,7 @@ class MacroAssembler : public Assembler {
   void Bkpt(Condition cond, uint32_t imm) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     bkpt(cond, imm);
   }
@@ -1147,7 +1522,7 @@ class MacroAssembler : public Assembler {
   void Bl(Condition cond, Label* label) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     bl(cond, label);
     AddBranchLabel(label);
@@ -1157,7 +1532,7 @@ class MacroAssembler : public Assembler {
   void Blx(Condition cond, Label* label) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     blx(cond, label);
     AddBranchLabel(label);
@@ -1165,9 +1540,10 @@ class MacroAssembler : public Assembler {
   void Blx(Label* label) { Blx(al, label); }
 
   void Blx(Condition cond, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // BLX{<c>}{<q>} <Rm> ; T1
         !rm.IsPC();
@@ -1177,9 +1553,10 @@ class MacroAssembler : public Assembler {
   void Blx(Register rm) { Blx(al, rm); }
 
   void Bx(Condition cond, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // BX{<c>}{<q>} <Rm> ; T1
         !rm.IsPC();
@@ -1189,26 +1566,29 @@ class MacroAssembler : public Assembler {
   void Bx(Register rm) { Bx(al, rm); }
 
   void Bxj(Condition cond, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     bxj(cond, rm);
   }
   void Bxj(Register rm) { Bxj(al, rm); }
 
   void Cbnz(Register rn, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     cbnz(rn, label);
     AddBranchLabel(label);
   }
 
   void Cbz(Register rn, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     cbz(rn, label);
     AddBranchLabel(label);
   }
@@ -1216,25 +1596,29 @@ class MacroAssembler : public Assembler {
   void Clrex(Condition cond) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     clrex(cond);
   }
   void Clrex() { Clrex(al); }
 
   void Clz(Condition cond, Register rd, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     clz(cond, rd, rm);
   }
   void Clz(Register rd, Register rm) { Clz(al, rd, rm); }
 
   void Cmn(Condition cond, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // CMN{<c>}{<q>} <Rn>, <Rm> ; T1
         operand.IsPlainRegister() && rn.IsLow() &&
@@ -1245,9 +1629,11 @@ class MacroAssembler : public Assembler {
   void Cmn(Register rn, const Operand& operand) { Cmn(al, rn, operand); }
 
   void Cmp(Condition cond, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // CMP{<c>}{<q>} <Rn>, #<imm8> ; T1
         (operand.IsImmediate() && (operand.GetImmediate() <= 255) &&
@@ -1261,18 +1647,24 @@ class MacroAssembler : public Assembler {
   void Cmp(Register rn, const Operand& operand) { Cmp(al, rn, operand); }
 
   void Crc32b(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     crc32b(cond, rd, rn, rm);
   }
   void Crc32b(Register rd, Register rn, Register rm) { Crc32b(al, rd, rn, rm); }
 
   void Crc32cb(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     crc32cb(cond, rd, rn, rm);
   }
@@ -1281,9 +1673,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Crc32ch(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     crc32ch(cond, rd, rn, rm);
   }
@@ -1292,9 +1687,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Crc32cw(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     crc32cw(cond, rd, rn, rm);
   }
@@ -1303,18 +1701,24 @@ class MacroAssembler : public Assembler {
   }
 
   void Crc32h(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     crc32h(cond, rd, rn, rm);
   }
   void Crc32h(Register rd, Register rn, Register rm) { Crc32h(al, rd, rn, rm); }
 
   void Crc32w(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     crc32w(cond, rd, rn, rm);
   }
@@ -1323,7 +1727,7 @@ class MacroAssembler : public Assembler {
   void Dmb(Condition cond, MemoryBarrier option) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     dmb(cond, option);
   }
@@ -1332,16 +1736,19 @@ class MacroAssembler : public Assembler {
   void Dsb(Condition cond, MemoryBarrier option) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     dsb(cond, option);
   }
   void Dsb(MemoryBarrier option) { Dsb(al, option); }
 
   void Eor(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     if (cond.Is(al) && rd.Is(rn) && operand.IsImmediate()) {
       uint32_t immediate = operand.GetImmediate();
       if (immediate == 0) {
@@ -1375,10 +1782,10 @@ class MacroAssembler : public Assembler {
         Eors(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rn.Is(rd) && operand.IsPlainRegister() &&
-                                    operand.GetBaseRegister().IsLow();
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rn.Is(rd) && operand.IsPlainRegister() &&
+                                   operand.GetBaseRegister().IsLow();
+        if (setflags_is_smaller) {
           Eors(cond, rd, rn, operand);
         } else {
           Eor(cond, rd, rn, operand);
@@ -1394,9 +1801,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Eors(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     eors(cond, rd, rn, operand);
   }
@@ -1408,9 +1818,11 @@ class MacroAssembler : public Assembler {
                Register rn,
                WriteBack write_back,
                DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     fldmdbx(cond, rn, write_back, dreglist);
   }
@@ -1422,9 +1834,11 @@ class MacroAssembler : public Assembler {
                Register rn,
                WriteBack write_back,
                DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     fldmiax(cond, rn, write_back, dreglist);
   }
@@ -1436,9 +1850,11 @@ class MacroAssembler : public Assembler {
                Register rn,
                WriteBack write_back,
                DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     fstmdbx(cond, rn, write_back, dreglist);
   }
@@ -1450,9 +1866,11 @@ class MacroAssembler : public Assembler {
                Register rn,
                WriteBack write_back,
                DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     fstmiax(cond, rn, write_back, dreglist);
   }
@@ -1463,7 +1881,7 @@ class MacroAssembler : public Assembler {
   void Hlt(Condition cond, uint32_t imm) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     hlt(cond, imm);
   }
@@ -1472,7 +1890,7 @@ class MacroAssembler : public Assembler {
   void Hvc(Condition cond, uint32_t imm) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     hvc(cond, imm);
   }
@@ -1481,44 +1899,51 @@ class MacroAssembler : public Assembler {
   void Isb(Condition cond, MemoryBarrier option) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     isb(cond, option);
   }
   void Isb(MemoryBarrier option) { Isb(al, option); }
 
-
   void Lda(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     lda(cond, rt, operand);
   }
   void Lda(Register rt, const MemOperand& operand) { Lda(al, rt, operand); }
 
   void Ldab(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldab(cond, rt, operand);
   }
   void Ldab(Register rt, const MemOperand& operand) { Ldab(al, rt, operand); }
 
   void Ldaex(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldaex(cond, rt, operand);
   }
   void Ldaex(Register rt, const MemOperand& operand) { Ldaex(al, rt, operand); }
 
   void Ldaexb(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldaexb(cond, rt, operand);
   }
@@ -1530,9 +1955,12 @@ class MacroAssembler : public Assembler {
               Register rt,
               Register rt2,
               const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldaexd(cond, rt, rt2, operand);
   }
@@ -1541,9 +1969,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Ldaexh(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldaexh(cond, rt, operand);
   }
@@ -1552,9 +1982,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Ldah(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldah(cond, rt, operand);
   }
@@ -1564,9 +1996,11 @@ class MacroAssembler : public Assembler {
            Register rn,
            WriteBack write_back,
            RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldm(cond, rn, write_back, registers);
   }
@@ -1578,9 +2012,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldmda(cond, rn, write_back, registers);
   }
@@ -1592,9 +2028,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldmdb(cond, rn, write_back, registers);
   }
@@ -1606,9 +2044,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldmea(cond, rn, write_back, registers);
   }
@@ -1620,9 +2060,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldmed(cond, rn, write_back, registers);
   }
@@ -1634,9 +2076,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldmfa(cond, rn, write_back, registers);
   }
@@ -1648,9 +2092,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldmfd(cond, rn, write_back, registers);
   }
@@ -1662,9 +2108,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldmib(cond, rn, write_back, registers);
   }
@@ -1673,9 +2121,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Ldr(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // LDR{<c>}{<q>} <Rt>, [<Rn> {, #{+}<imm>}] ; T1
         (operand.IsImmediate() && rt.IsLow() &&
@@ -1698,18 +2148,21 @@ class MacroAssembler : public Assembler {
   void Ldr(Register rt, const MemOperand& operand) { Ldr(al, rt, operand); }
 
   void Ldr(Condition cond, Register rt, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldr(cond, rt, label);
   }
   void Ldr(Register rt, Label* label) { Ldr(al, rt, label); }
 
   void Ldrb(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // LDRB{<c>}{<q>} <Rt>, [<Rn> {, #{+}<imm>}] ; T1
         (operand.IsImmediate() && rt.IsLow() &&
@@ -1727,9 +2180,10 @@ class MacroAssembler : public Assembler {
   void Ldrb(Register rt, const MemOperand& operand) { Ldrb(al, rt, operand); }
 
   void Ldrb(Condition cond, Register rt, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrb(cond, rt, label);
   }
@@ -1739,9 +2193,12 @@ class MacroAssembler : public Assembler {
             Register rt,
             Register rt2,
             const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrd(cond, rt, rt2, operand);
   }
@@ -1750,9 +2207,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Ldrd(Condition cond, Register rt, Register rt2, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrd(cond, rt, rt2, label);
   }
@@ -1761,18 +2220,22 @@ class MacroAssembler : public Assembler {
   }
 
   void Ldrex(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrex(cond, rt, operand);
   }
   void Ldrex(Register rt, const MemOperand& operand) { Ldrex(al, rt, operand); }
 
   void Ldrexb(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrexb(cond, rt, operand);
   }
@@ -1784,9 +2247,12 @@ class MacroAssembler : public Assembler {
               Register rt,
               Register rt2,
               const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrexd(cond, rt, rt2, operand);
   }
@@ -1795,9 +2261,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Ldrexh(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrexh(cond, rt, operand);
   }
@@ -1806,9 +2274,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Ldrh(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // LDRH{<c>}{<q>} <Rt>, [<Rn> {, #{+}<imm>}] ; T1
         (operand.IsImmediate() && rt.IsLow() &&
@@ -1826,18 +2296,21 @@ class MacroAssembler : public Assembler {
   void Ldrh(Register rt, const MemOperand& operand) { Ldrh(al, rt, operand); }
 
   void Ldrh(Condition cond, Register rt, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrh(cond, rt, label);
   }
   void Ldrh(Register rt, Label* label) { Ldrh(al, rt, label); }
 
   void Ldrsb(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // LDRSB{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>] ; T1
         operand.IsPlainRegister() && rt.IsLow() &&
@@ -1850,18 +2323,21 @@ class MacroAssembler : public Assembler {
   void Ldrsb(Register rt, const MemOperand& operand) { Ldrsb(al, rt, operand); }
 
   void Ldrsb(Condition cond, Register rt, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrsb(cond, rt, label);
   }
   void Ldrsb(Register rt, Label* label) { Ldrsb(al, rt, label); }
 
   void Ldrsh(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // LDRSH{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>] ; T1
         operand.IsPlainRegister() && rt.IsLow() &&
@@ -1874,18 +2350,22 @@ class MacroAssembler : public Assembler {
   void Ldrsh(Register rt, const MemOperand& operand) { Ldrsh(al, rt, operand); }
 
   void Ldrsh(Condition cond, Register rt, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ldrsh(cond, rt, label);
   }
   void Ldrsh(Register rt, Label* label) { Ldrsh(al, rt, label); }
 
   void Lsl(Condition cond, Register rd, Register rm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // LSL<c>{<q>} {<Rd>,} <Rm>, #<imm> ; T2
         (operand.IsImmediate() && (operand.GetImmediate() >= 1) &&
@@ -1912,11 +2392,12 @@ class MacroAssembler : public Assembler {
         Lsls(cond, rd, rm, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rm.IsLow() && operand.IsImmediate() &&
-                                    (operand.GetImmediate() < 32) &&
-                                    (operand.GetImmediate() != 0);
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller =
+            IsUsingT32() && cond.Is(al) && rd.IsLow() && rm.IsLow() &&
+            ((operand.IsImmediate() && (operand.GetImmediate() >= 1) &&
+              (operand.GetImmediate() < 32)) ||
+             (operand.IsPlainRegister() && rd.Is(rm)));
+        if (setflags_is_smaller) {
           Lsls(cond, rd, rm, operand);
         } else {
           Lsl(cond, rd, rm, operand);
@@ -1932,9 +2413,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Lsls(Condition cond, Register rd, Register rm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     lsls(cond, rd, rm, operand);
   }
@@ -1943,9 +2427,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Lsr(Condition cond, Register rd, Register rm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // LSR<c>{<q>} {<Rd>,} <Rm>, #<imm> ; T2
         (operand.IsImmediate() && (operand.GetImmediate() >= 1) &&
@@ -1972,10 +2459,12 @@ class MacroAssembler : public Assembler {
         Lsrs(cond, rd, rm, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rm.IsLow() && operand.IsImmediate() &&
-                                    (operand.GetImmediate() < 32);
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller =
+            IsUsingT32() && cond.Is(al) && rd.IsLow() && rm.IsLow() &&
+            ((operand.IsImmediate() && (operand.GetImmediate() >= 1) &&
+              (operand.GetImmediate() <= 32)) ||
+             (operand.IsPlainRegister() && rd.Is(rm)));
+        if (setflags_is_smaller) {
           Lsrs(cond, rd, rm, operand);
         } else {
           Lsr(cond, rd, rm, operand);
@@ -1991,9 +2480,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Lsrs(Condition cond, Register rd, Register rm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     lsrs(cond, rd, rm, operand);
   }
@@ -2002,9 +2494,13 @@ class MacroAssembler : public Assembler {
   }
 
   void Mla(Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     mla(cond, rd, rn, rm, ra);
   }
@@ -2036,9 +2532,13 @@ class MacroAssembler : public Assembler {
 
   void Mlas(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     mlas(cond, rd, rn, rm, ra);
   }
@@ -2047,9 +2547,13 @@ class MacroAssembler : public Assembler {
   }
 
   void Mls(Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     mls(cond, rd, rn, rm, ra);
   }
@@ -2058,9 +2562,14 @@ class MacroAssembler : public Assembler {
   }
 
   void Mov(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
+    if (operand.IsPlainRegister() && rd.Is(operand.GetBaseRegister())) {
+      return;
+    }
     bool can_use_it =
         // MOV<c>{<q>} <Rd>, #<imm8> ; T1
         (operand.IsImmediate() && rd.IsLow() &&
@@ -2098,13 +2607,18 @@ class MacroAssembler : public Assembler {
         Movs(cond, rd, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded =
+        if (operand.IsPlainRegister() && rd.Is(operand.GetBaseRegister())) {
+          return;
+        }
+        bool setflags_is_smaller =
             IsUsingT32() && cond.Is(al) &&
             ((operand.IsImmediateShiftedRegister() && rd.IsLow() &&
               operand.GetBaseRegister().IsLow() &&
-              (operand.GetShiftAmount() < 32) &&
-              (operand.GetShift().IsLSL() || operand.GetShift().IsLSR() ||
-               operand.GetShift().IsASR())) ||
+              (operand.GetShiftAmount() >= 1) &&
+              (((operand.GetShiftAmount() <= 32) &&
+                ((operand.GetShift().IsLSR() || operand.GetShift().IsASR()))) ||
+               ((operand.GetShiftAmount() < 32) &&
+                operand.GetShift().IsLSL()))) ||
              (operand.IsRegisterShiftedRegister() && rd.IsLow() &&
               operand.GetBaseRegister().Is(rd) &&
               operand.GetShiftRegister().IsLow() &&
@@ -2112,7 +2626,7 @@ class MacroAssembler : public Assembler {
                operand.GetShift().IsASR() || operand.GetShift().IsROR())) ||
              (operand.IsImmediate() && rd.IsLow() &&
               (operand.GetImmediate() < 256)));
-        if (can_be_16bit_encoded) {
+        if (setflags_is_smaller) {
           Movs(cond, rd, operand);
         } else {
           Mov(cond, rd, operand);
@@ -2125,36 +2639,32 @@ class MacroAssembler : public Assembler {
   }
 
   void Movs(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     movs(cond, rd, operand);
   }
   void Movs(Register rd, const Operand& operand) { Movs(al, rd, operand); }
 
   void Movt(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     movt(cond, rd, operand);
   }
   void Movt(Register rd, const Operand& operand) { Movt(al, rd, operand); }
 
-  void Movw(Condition cond, Register rd, const Operand& operand) {
-    VIXL_ASSERT(allow_macro_instructions_);
-    VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    ITScope it_scope(this, &cond);
-    movw(cond, rd, operand);
-  }
-  void Movw(Register rd, const Operand& operand) { Movw(al, rd, operand); }
-
   void Mrs(Condition cond, Register rd, SpecialRegister spec_reg) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     mrs(cond, rd, spec_reg);
   }
@@ -2163,9 +2673,10 @@ class MacroAssembler : public Assembler {
   void Msr(Condition cond,
            MaskedSpecialRegister spec_reg,
            const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     msr(cond, spec_reg, operand);
   }
@@ -2174,9 +2685,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Mul(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // MUL<c>{<q>} <Rdm>, <Rn>{, <Rdm>} ; T1
         rd.Is(rm) && rn.IsLow() && rm.IsLow();
@@ -2197,9 +2711,9 @@ class MacroAssembler : public Assembler {
         Muls(cond, rd, rn, rm);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rn.IsLow() && rm.Is(rd);
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rn.IsLow() && rm.Is(rd);
+        if (setflags_is_smaller) {
           Muls(cond, rd, rn, rm);
         } else {
           Mul(cond, rd, rn, rm);
@@ -2212,18 +2726,23 @@ class MacroAssembler : public Assembler {
   }
 
   void Muls(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     muls(cond, rd, rn, rm);
   }
   void Muls(Register rd, Register rn, Register rm) { Muls(al, rd, rn, rm); }
 
   void Mvn(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // MVN<c>{<q>} <Rd>, <Rm> ; T1
         operand.IsPlainRegister() && rd.IsLow() &&
@@ -2244,10 +2763,10 @@ class MacroAssembler : public Assembler {
         Mvns(cond, rd, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    operand.IsPlainRegister() &&
-                                    operand.GetBaseRegister().IsLow();
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   operand.IsPlainRegister() &&
+                                   operand.GetBaseRegister().IsLow();
+        if (setflags_is_smaller) {
           Mvns(cond, rd, operand);
         } else {
           Mvn(cond, rd, operand);
@@ -2260,9 +2779,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Mvns(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     mvns(cond, rd, operand);
   }
@@ -2271,23 +2792,26 @@ class MacroAssembler : public Assembler {
   void Nop(Condition cond) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     nop(cond);
   }
   void Nop() { Nop(al); }
 
   void Orn(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    if (cond.Is(al) && rd.Is(rn) && operand.IsImmediate()) {
+    MacroEmissionCheckScope guard(this);
+    if (cond.Is(al) && operand.IsImmediate()) {
       uint32_t immediate = operand.GetImmediate();
       if (immediate == 0) {
-        mov(rd, 0xffffffff);
+        mvn(rd, 0);
         return;
       }
-      if (immediate == 0xffffffff) {
+      if ((immediate == 0xffffffff) && rd.Is(rn)) {
         return;
       }
     }
@@ -2322,9 +2846,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Orns(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     orns(cond, rd, rn, operand);
   }
@@ -2333,16 +2860,23 @@ class MacroAssembler : public Assembler {
   }
 
   void Orr(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    if (cond.Is(al) && rd.Is(rn) && operand.IsImmediate()) {
+    MacroEmissionCheckScope guard(this);
+    if (rd.Is(rn) && operand.IsPlainRegister() &&
+        rd.Is(operand.GetBaseRegister())) {
+      return;
+    }
+    if (cond.Is(al) && operand.IsImmediate()) {
       uint32_t immediate = operand.GetImmediate();
-      if (immediate == 0) {
+      if ((immediate == 0) && rd.Is(rn)) {
         return;
       }
       if (immediate == 0xffffffff) {
-        mov(rd, 0xffffffff);
+        mvn(rd, 0);
         return;
       }
     }
@@ -2369,10 +2903,14 @@ class MacroAssembler : public Assembler {
         Orrs(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rn.Is(rd) && operand.IsPlainRegister() &&
-                                    operand.GetBaseRegister().IsLow();
-        if (can_be_16bit_encoded) {
+        if (operand.IsPlainRegister() && rd.Is(rn) &&
+            rd.Is(operand.GetBaseRegister())) {
+          return;
+        }
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rn.Is(rd) && operand.IsPlainRegister() &&
+                                   operand.GetBaseRegister().IsLow();
+        if (setflags_is_smaller) {
           Orrs(cond, rd, rn, operand);
         } else {
           Orr(cond, rd, rn, operand);
@@ -2388,9 +2926,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Orrs(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     orrs(cond, rd, rn, operand);
   }
@@ -2399,9 +2940,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Pkhbt(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pkhbt(cond, rd, rn, operand);
   }
@@ -2410,9 +2954,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Pkhtb(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pkhtb(cond, rd, rn, operand);
   }
@@ -2423,34 +2970,37 @@ class MacroAssembler : public Assembler {
   void Pld(Condition cond, Label* label) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pld(cond, label);
   }
   void Pld(Label* label) { Pld(al, label); }
 
   void Pld(Condition cond, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pld(cond, operand);
   }
   void Pld(const MemOperand& operand) { Pld(al, operand); }
 
   void Pldw(Condition cond, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pldw(cond, operand);
   }
   void Pldw(const MemOperand& operand) { Pldw(al, operand); }
 
   void Pli(Condition cond, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pli(cond, operand);
   }
@@ -2459,185 +3009,227 @@ class MacroAssembler : public Assembler {
   void Pli(Condition cond, Label* label) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pli(cond, label);
   }
   void Pli(Label* label) { Pli(al, label); }
 
   void Pop(Condition cond, RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pop(cond, registers);
   }
   void Pop(RegisterList registers) { Pop(al, registers); }
 
   void Pop(Condition cond, Register rt) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     pop(cond, rt);
   }
   void Pop(Register rt) { Pop(al, rt); }
 
   void Push(Condition cond, RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     push(cond, registers);
   }
   void Push(RegisterList registers) { Push(al, registers); }
 
   void Push(Condition cond, Register rt) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     push(cond, rt);
   }
   void Push(Register rt) { Push(al, rt); }
 
   void Qadd(Condition cond, Register rd, Register rm, Register rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qadd(cond, rd, rm, rn);
   }
   void Qadd(Register rd, Register rm, Register rn) { Qadd(al, rd, rm, rn); }
 
   void Qadd16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qadd16(cond, rd, rn, rm);
   }
   void Qadd16(Register rd, Register rn, Register rm) { Qadd16(al, rd, rn, rm); }
 
   void Qadd8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qadd8(cond, rd, rn, rm);
   }
   void Qadd8(Register rd, Register rn, Register rm) { Qadd8(al, rd, rn, rm); }
 
   void Qasx(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qasx(cond, rd, rn, rm);
   }
   void Qasx(Register rd, Register rn, Register rm) { Qasx(al, rd, rn, rm); }
 
   void Qdadd(Condition cond, Register rd, Register rm, Register rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qdadd(cond, rd, rm, rn);
   }
   void Qdadd(Register rd, Register rm, Register rn) { Qdadd(al, rd, rm, rn); }
 
   void Qdsub(Condition cond, Register rd, Register rm, Register rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qdsub(cond, rd, rm, rn);
   }
   void Qdsub(Register rd, Register rm, Register rn) { Qdsub(al, rd, rm, rn); }
 
   void Qsax(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qsax(cond, rd, rn, rm);
   }
   void Qsax(Register rd, Register rn, Register rm) { Qsax(al, rd, rn, rm); }
 
   void Qsub(Condition cond, Register rd, Register rm, Register rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qsub(cond, rd, rm, rn);
   }
   void Qsub(Register rd, Register rm, Register rn) { Qsub(al, rd, rm, rn); }
 
   void Qsub16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qsub16(cond, rd, rn, rm);
   }
   void Qsub16(Register rd, Register rn, Register rm) { Qsub16(al, rd, rn, rm); }
 
   void Qsub8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     qsub8(cond, rd, rn, rm);
   }
   void Qsub8(Register rd, Register rn, Register rm) { Qsub8(al, rd, rn, rm); }
 
   void Rbit(Condition cond, Register rd, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rbit(cond, rd, rm);
   }
   void Rbit(Register rd, Register rm) { Rbit(al, rd, rm); }
 
   void Rev(Condition cond, Register rd, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rev(cond, rd, rm);
   }
   void Rev(Register rd, Register rm) { Rev(al, rd, rm); }
 
   void Rev16(Condition cond, Register rd, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rev16(cond, rd, rm);
   }
   void Rev16(Register rd, Register rm) { Rev16(al, rd, rm); }
 
   void Revsh(Condition cond, Register rd, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     revsh(cond, rd, rm);
   }
   void Revsh(Register rd, Register rm) { Revsh(al, rd, rm); }
 
   void Ror(Condition cond, Register rd, Register rm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
-        // ROR<c>{<q>} {<Rd>,} <Rm>, #<imm> ; T2
-        (operand.IsImmediate() && (operand.GetImmediate() >= 1) &&
-         (operand.GetImmediate() <= 31) && rd.IsLow() && rm.IsLow()) ||
         // ROR<c>{<q>} {<Rdm>,} <Rdm>, <Rs> ; T1
-        (operand.IsPlainRegister() && rd.Is(rm) && rd.IsLow() &&
-         operand.GetBaseRegister().IsLow());
+        operand.IsPlainRegister() && rd.Is(rm) && rd.IsLow() &&
+        operand.GetBaseRegister().IsLow();
     ITScope it_scope(this, &cond, can_use_it);
     ror(cond, rd, rm, operand);
   }
@@ -2657,7 +3249,14 @@ class MacroAssembler : public Assembler {
         Rors(cond, rd, rm, operand);
         break;
       case DontCare:
-        Ror(cond, rd, rm, operand);
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rm.IsLow() && operand.IsPlainRegister() &&
+                                   rd.Is(rm);
+        if (setflags_is_smaller) {
+          Rors(cond, rd, rm, operand);
+        } else {
+          Ror(cond, rd, rm, operand);
+        }
         break;
     }
   }
@@ -2669,9 +3268,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Rors(Condition cond, Register rd, Register rm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rors(cond, rd, rm, operand);
   }
@@ -2680,9 +3282,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Rrx(Condition cond, Register rd, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rrx(cond, rd, rm);
   }
@@ -2705,18 +3309,23 @@ class MacroAssembler : public Assembler {
   }
 
   void Rrxs(Condition cond, Register rd, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rrxs(cond, rd, rm);
   }
   void Rrxs(Register rd, Register rm) { Rrxs(al, rd, rm); }
 
   void Rsb(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // RSB<c>{<q>} {<Rd>, }<Rn>, #0 ; T1
         operand.IsImmediate() && rd.IsLow() && rn.IsLow() &&
@@ -2740,10 +3349,10 @@ class MacroAssembler : public Assembler {
         Rsbs(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rn.IsLow() && operand.IsImmediate() &&
-                                    (operand.GetImmediate() == 0);
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rn.IsLow() && operand.IsImmediate() &&
+                                   (operand.GetImmediate() == 0);
+        if (setflags_is_smaller) {
           Rsbs(cond, rd, rn, operand);
         } else {
           Rsb(cond, rd, rn, operand);
@@ -2759,9 +3368,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Rsbs(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rsbs(cond, rd, rn, operand);
   }
@@ -2770,9 +3382,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Rsc(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rsc(cond, rd, rn, operand);
   }
@@ -2804,9 +3419,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Rscs(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     rscs(cond, rd, rn, operand);
   }
@@ -2815,36 +3433,48 @@ class MacroAssembler : public Assembler {
   }
 
   void Sadd16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sadd16(cond, rd, rn, rm);
   }
   void Sadd16(Register rd, Register rn, Register rm) { Sadd16(al, rd, rn, rm); }
 
   void Sadd8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sadd8(cond, rd, rn, rm);
   }
   void Sadd8(Register rd, Register rn, Register rm) { Sadd8(al, rd, rn, rm); }
 
   void Sasx(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sasx(cond, rd, rn, rm);
   }
   void Sasx(Register rd, Register rn, Register rm) { Sasx(al, rd, rn, rm); }
 
   void Sbc(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // SBC<c>{<q>} {<Rdn>,} <Rdn>, <Rm> ; T1
         operand.IsPlainRegister() && rn.IsLow() && rd.Is(rn) &&
@@ -2868,10 +3498,10 @@ class MacroAssembler : public Assembler {
         Sbcs(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
-                                    rn.Is(rd) && operand.IsPlainRegister() &&
-                                    operand.GetBaseRegister().IsLow();
-        if (can_be_16bit_encoded) {
+        bool setflags_is_smaller = IsUsingT32() && cond.Is(al) && rd.IsLow() &&
+                                   rn.Is(rd) && operand.IsPlainRegister() &&
+                                   operand.GetBaseRegister().IsLow();
+        if (setflags_is_smaller) {
           Sbcs(cond, rd, rn, operand);
         } else {
           Sbc(cond, rd, rn, operand);
@@ -2887,9 +3517,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Sbcs(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sbcs(cond, rd, rn, operand);
   }
@@ -2902,9 +3535,12 @@ class MacroAssembler : public Assembler {
             Register rn,
             uint32_t lsb,
             const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sbfx(cond, rd, rn, lsb, operand);
   }
@@ -2913,27 +3549,36 @@ class MacroAssembler : public Assembler {
   }
 
   void Sdiv(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sdiv(cond, rd, rn, rm);
   }
   void Sdiv(Register rd, Register rn, Register rm) { Sdiv(al, rd, rn, rm); }
 
   void Sel(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sel(cond, rd, rn, rm);
   }
   void Sel(Register rd, Register rn, Register rm) { Sel(al, rd, rn, rm); }
 
   void Shadd16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     shadd16(cond, rd, rn, rm);
   }
@@ -2942,36 +3587,48 @@ class MacroAssembler : public Assembler {
   }
 
   void Shadd8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     shadd8(cond, rd, rn, rm);
   }
   void Shadd8(Register rd, Register rn, Register rm) { Shadd8(al, rd, rn, rm); }
 
   void Shasx(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     shasx(cond, rd, rn, rm);
   }
   void Shasx(Register rd, Register rn, Register rm) { Shasx(al, rd, rn, rm); }
 
   void Shsax(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     shsax(cond, rd, rn, rm);
   }
   void Shsax(Register rd, Register rn, Register rm) { Shsax(al, rd, rn, rm); }
 
   void Shsub16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     shsub16(cond, rd, rn, rm);
   }
@@ -2980,9 +3637,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Shsub8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     shsub8(cond, rd, rn, rm);
   }
@@ -2990,9 +3650,13 @@ class MacroAssembler : public Assembler {
 
   void Smlabb(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlabb(cond, rd, rn, rm, ra);
   }
@@ -3002,9 +3666,13 @@ class MacroAssembler : public Assembler {
 
   void Smlabt(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlabt(cond, rd, rn, rm, ra);
   }
@@ -3014,9 +3682,13 @@ class MacroAssembler : public Assembler {
 
   void Smlad(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlad(cond, rd, rn, rm, ra);
   }
@@ -3026,9 +3698,13 @@ class MacroAssembler : public Assembler {
 
   void Smladx(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smladx(cond, rd, rn, rm, ra);
   }
@@ -3038,9 +3714,13 @@ class MacroAssembler : public Assembler {
 
   void Smlal(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlal(cond, rdlo, rdhi, rn, rm);
   }
@@ -3050,9 +3730,13 @@ class MacroAssembler : public Assembler {
 
   void Smlalbb(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlalbb(cond, rdlo, rdhi, rn, rm);
   }
@@ -3062,9 +3746,13 @@ class MacroAssembler : public Assembler {
 
   void Smlalbt(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlalbt(cond, rdlo, rdhi, rn, rm);
   }
@@ -3074,9 +3762,13 @@ class MacroAssembler : public Assembler {
 
   void Smlald(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlald(cond, rdlo, rdhi, rn, rm);
   }
@@ -3086,9 +3778,13 @@ class MacroAssembler : public Assembler {
 
   void Smlaldx(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlaldx(cond, rdlo, rdhi, rn, rm);
   }
@@ -3098,9 +3794,13 @@ class MacroAssembler : public Assembler {
 
   void Smlals(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlals(cond, rdlo, rdhi, rn, rm);
   }
@@ -3110,9 +3810,13 @@ class MacroAssembler : public Assembler {
 
   void Smlaltb(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlaltb(cond, rdlo, rdhi, rn, rm);
   }
@@ -3122,9 +3826,13 @@ class MacroAssembler : public Assembler {
 
   void Smlaltt(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlaltt(cond, rdlo, rdhi, rn, rm);
   }
@@ -3134,9 +3842,13 @@ class MacroAssembler : public Assembler {
 
   void Smlatb(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlatb(cond, rd, rn, rm, ra);
   }
@@ -3146,9 +3858,13 @@ class MacroAssembler : public Assembler {
 
   void Smlatt(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlatt(cond, rd, rn, rm, ra);
   }
@@ -3158,9 +3874,13 @@ class MacroAssembler : public Assembler {
 
   void Smlawb(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlawb(cond, rd, rn, rm, ra);
   }
@@ -3170,9 +3890,13 @@ class MacroAssembler : public Assembler {
 
   void Smlawt(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlawt(cond, rd, rn, rm, ra);
   }
@@ -3182,9 +3906,13 @@ class MacroAssembler : public Assembler {
 
   void Smlsd(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlsd(cond, rd, rn, rm, ra);
   }
@@ -3194,9 +3922,13 @@ class MacroAssembler : public Assembler {
 
   void Smlsdx(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlsdx(cond, rd, rn, rm, ra);
   }
@@ -3206,9 +3938,13 @@ class MacroAssembler : public Assembler {
 
   void Smlsld(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlsld(cond, rdlo, rdhi, rn, rm);
   }
@@ -3218,9 +3954,13 @@ class MacroAssembler : public Assembler {
 
   void Smlsldx(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smlsldx(cond, rdlo, rdhi, rn, rm);
   }
@@ -3230,9 +3970,13 @@ class MacroAssembler : public Assembler {
 
   void Smmla(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smmla(cond, rd, rn, rm, ra);
   }
@@ -3242,9 +3986,13 @@ class MacroAssembler : public Assembler {
 
   void Smmlar(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smmlar(cond, rd, rn, rm, ra);
   }
@@ -3254,9 +4002,13 @@ class MacroAssembler : public Assembler {
 
   void Smmls(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smmls(cond, rd, rn, rm, ra);
   }
@@ -3266,9 +4018,13 @@ class MacroAssembler : public Assembler {
 
   void Smmlsr(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smmlsr(cond, rd, rn, rm, ra);
   }
@@ -3277,54 +4033,72 @@ class MacroAssembler : public Assembler {
   }
 
   void Smmul(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smmul(cond, rd, rn, rm);
   }
   void Smmul(Register rd, Register rn, Register rm) { Smmul(al, rd, rn, rm); }
 
   void Smmulr(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smmulr(cond, rd, rn, rm);
   }
   void Smmulr(Register rd, Register rn, Register rm) { Smmulr(al, rd, rn, rm); }
 
   void Smuad(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smuad(cond, rd, rn, rm);
   }
   void Smuad(Register rd, Register rn, Register rm) { Smuad(al, rd, rn, rm); }
 
   void Smuadx(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smuadx(cond, rd, rn, rm);
   }
   void Smuadx(Register rd, Register rn, Register rm) { Smuadx(al, rd, rn, rm); }
 
   void Smulbb(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smulbb(cond, rd, rn, rm);
   }
   void Smulbb(Register rd, Register rn, Register rm) { Smulbb(al, rd, rn, rm); }
 
   void Smulbt(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smulbt(cond, rd, rn, rm);
   }
@@ -3332,9 +4106,13 @@ class MacroAssembler : public Assembler {
 
   void Smull(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smull(cond, rdlo, rdhi, rn, rm);
   }
@@ -3369,9 +4147,13 @@ class MacroAssembler : public Assembler {
 
   void Smulls(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smulls(cond, rdlo, rdhi, rn, rm);
   }
@@ -3380,63 +4162,83 @@ class MacroAssembler : public Assembler {
   }
 
   void Smultb(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smultb(cond, rd, rn, rm);
   }
   void Smultb(Register rd, Register rn, Register rm) { Smultb(al, rd, rn, rm); }
 
   void Smultt(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smultt(cond, rd, rn, rm);
   }
   void Smultt(Register rd, Register rn, Register rm) { Smultt(al, rd, rn, rm); }
 
   void Smulwb(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smulwb(cond, rd, rn, rm);
   }
   void Smulwb(Register rd, Register rn, Register rm) { Smulwb(al, rd, rn, rm); }
 
   void Smulwt(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smulwt(cond, rd, rn, rm);
   }
   void Smulwt(Register rd, Register rn, Register rm) { Smulwt(al, rd, rn, rm); }
 
   void Smusd(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smusd(cond, rd, rn, rm);
   }
   void Smusd(Register rd, Register rn, Register rm) { Smusd(al, rd, rn, rm); }
 
   void Smusdx(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     smusdx(cond, rd, rn, rm);
   }
   void Smusdx(Register rd, Register rn, Register rm) { Smusdx(al, rd, rn, rm); }
 
   void Ssat(Condition cond, Register rd, uint32_t imm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ssat(cond, rd, imm, operand);
   }
@@ -3445,9 +4247,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Ssat16(Condition cond, Register rd, uint32_t imm, Register rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ssat16(cond, rd, imm, rn);
   }
@@ -3456,45 +4260,58 @@ class MacroAssembler : public Assembler {
   }
 
   void Ssax(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ssax(cond, rd, rn, rm);
   }
   void Ssax(Register rd, Register rn, Register rm) { Ssax(al, rd, rn, rm); }
 
   void Ssub16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ssub16(cond, rd, rn, rm);
   }
   void Ssub16(Register rd, Register rn, Register rm) { Ssub16(al, rd, rn, rm); }
 
   void Ssub8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ssub8(cond, rd, rn, rm);
   }
   void Ssub8(Register rd, Register rn, Register rm) { Ssub8(al, rd, rn, rm); }
 
   void Stl(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stl(cond, rt, operand);
   }
   void Stl(Register rt, const MemOperand& operand) { Stl(al, rt, operand); }
 
   void Stlb(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stlb(cond, rt, operand);
   }
@@ -3504,9 +4321,12 @@ class MacroAssembler : public Assembler {
              Register rd,
              Register rt,
              const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stlex(cond, rd, rt, operand);
   }
@@ -3518,9 +4338,12 @@ class MacroAssembler : public Assembler {
               Register rd,
               Register rt,
               const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stlexb(cond, rd, rt, operand);
   }
@@ -3533,9 +4356,13 @@ class MacroAssembler : public Assembler {
               Register rt,
               Register rt2,
               const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stlexd(cond, rd, rt, rt2, operand);
   }
@@ -3550,9 +4377,12 @@ class MacroAssembler : public Assembler {
               Register rd,
               Register rt,
               const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stlexh(cond, rd, rt, operand);
   }
@@ -3561,9 +4391,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Stlh(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stlh(cond, rt, operand);
   }
@@ -3573,9 +4405,11 @@ class MacroAssembler : public Assembler {
            Register rn,
            WriteBack write_back,
            RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stm(cond, rn, write_back, registers);
   }
@@ -3587,9 +4421,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stmda(cond, rn, write_back, registers);
   }
@@ -3601,9 +4437,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stmdb(cond, rn, write_back, registers);
   }
@@ -3615,9 +4453,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stmea(cond, rn, write_back, registers);
   }
@@ -3629,9 +4469,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stmed(cond, rn, write_back, registers);
   }
@@ -3643,9 +4485,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stmfa(cond, rn, write_back, registers);
   }
@@ -3657,9 +4501,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stmfd(cond, rn, write_back, registers);
   }
@@ -3671,9 +4517,11 @@ class MacroAssembler : public Assembler {
              Register rn,
              WriteBack write_back,
              RegisterList registers) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(registers));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     stmib(cond, rn, write_back, registers);
   }
@@ -3682,9 +4530,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Str(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // STR{<c>}{<q>} <Rt>, [<Rn> {, #{+}<imm>}] ; T1
         (operand.IsImmediate() && rt.IsLow() &&
@@ -3707,9 +4557,11 @@ class MacroAssembler : public Assembler {
   void Str(Register rt, const MemOperand& operand) { Str(al, rt, operand); }
 
   void Strb(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // STRB{<c>}{<q>} <Rt>, [<Rn> {, #{+}<imm>}] ; T1
         (operand.IsImmediate() && rt.IsLow() &&
@@ -3730,9 +4582,12 @@ class MacroAssembler : public Assembler {
             Register rt,
             Register rt2,
             const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     strd(cond, rt, rt2, operand);
   }
@@ -3744,9 +4599,12 @@ class MacroAssembler : public Assembler {
              Register rd,
              Register rt,
              const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     strex(cond, rd, rt, operand);
   }
@@ -3758,9 +4616,12 @@ class MacroAssembler : public Assembler {
               Register rd,
               Register rt,
               const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     strexb(cond, rd, rt, operand);
   }
@@ -3773,9 +4634,13 @@ class MacroAssembler : public Assembler {
               Register rt,
               Register rt2,
               const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     strexd(cond, rd, rt, rt2, operand);
   }
@@ -3790,9 +4655,12 @@ class MacroAssembler : public Assembler {
               Register rd,
               Register rt,
               const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     strexh(cond, rd, rt, operand);
   }
@@ -3801,9 +4669,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Strh(Condition cond, Register rt, const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // STRH{<c>}{<q>} <Rt>, [<Rn> {, #{+}<imm>}] ; T1
         (operand.IsImmediate() && rt.IsLow() &&
@@ -3821,9 +4691,12 @@ class MacroAssembler : public Assembler {
   void Strh(Register rt, const MemOperand& operand) { Strh(al, rt, operand); }
 
   void Sub(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     if (cond.Is(al) && rd.Is(rn) && operand.IsImmediate()) {
       uint32_t immediate = operand.GetImmediate();
       if (immediate == 0) {
@@ -3859,17 +4732,27 @@ class MacroAssembler : public Assembler {
         Subs(cond, rd, rn, operand);
         break;
       case DontCare:
-        bool can_be_16bit_encoded =
+        bool setflags_is_smaller =
             IsUsingT32() && cond.Is(al) &&
             ((operand.IsPlainRegister() && rd.IsLow() && rn.IsLow() &&
               operand.GetBaseRegister().IsLow()) ||
              (operand.IsImmediate() &&
               ((rd.IsLow() && rn.IsLow() && (operand.GetImmediate() < 8)) ||
                (rd.IsLow() && rn.Is(rd) && (operand.GetImmediate() < 256)))));
-        if (can_be_16bit_encoded) {
+        if (setflags_is_smaller) {
           Subs(cond, rd, rn, operand);
         } else {
-          Sub(cond, rd, rn, operand);
+          bool changed_op_is_smaller =
+              operand.IsImmediate() && (operand.GetSignedImmediate() < 0) &&
+              ((rd.IsLow() && rn.IsLow() &&
+                (operand.GetSignedImmediate() >= -7)) ||
+               (rd.IsLow() && rn.Is(rd) &&
+                (operand.GetSignedImmediate() >= -255)));
+          if (changed_op_is_smaller) {
+            Adds(cond, rd, rn, -operand.GetSignedImmediate());
+          } else {
+            Sub(cond, rd, rn, operand);
+          }
         }
         break;
     }
@@ -3882,9 +4765,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Subs(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     subs(cond, rd, rn, operand);
   }
@@ -3892,30 +4778,22 @@ class MacroAssembler : public Assembler {
     Subs(al, rd, rn, operand);
   }
 
-  void Subw(Condition cond, Register rd, Register rn, const Operand& operand) {
-    VIXL_ASSERT(allow_macro_instructions_);
-    VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    ITScope it_scope(this, &cond);
-    subw(cond, rd, rn, operand);
-  }
-  void Subw(Register rd, Register rn, const Operand& operand) {
-    Subw(al, rd, rn, operand);
-  }
-
   void Svc(Condition cond, uint32_t imm) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     svc(cond, imm);
   }
   void Svc(uint32_t imm) { Svc(al, imm); }
 
   void Sxtab(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sxtab(cond, rd, rn, operand);
   }
@@ -3927,9 +4805,12 @@ class MacroAssembler : public Assembler {
                Register rd,
                Register rn,
                const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sxtab16(cond, rd, rn, operand);
   }
@@ -3938,9 +4819,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Sxtah(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sxtah(cond, rd, rn, operand);
   }
@@ -3949,63 +4833,55 @@ class MacroAssembler : public Assembler {
   }
 
   void Sxtb(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sxtb(cond, rd, operand);
   }
   void Sxtb(Register rd, const Operand& operand) { Sxtb(al, rd, operand); }
 
   void Sxtb16(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sxtb16(cond, rd, operand);
   }
   void Sxtb16(Register rd, const Operand& operand) { Sxtb16(al, rd, operand); }
 
   void Sxth(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     sxth(cond, rd, operand);
   }
   void Sxth(Register rd, const Operand& operand) { Sxth(al, rd, operand); }
 
-  void Tbb(Condition cond, Register rn, Register rm) {
-    VIXL_ASSERT(allow_macro_instructions_);
-    VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    ITScope it_scope(this, &cond);
-    tbb(cond, rn, rm);
-  }
-  void Tbb(Register rn, Register rm) { Tbb(al, rn, rm); }
-
-  void Tbh(Condition cond, Register rn, Register rm) {
-    VIXL_ASSERT(allow_macro_instructions_);
-    VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
-    ITScope it_scope(this, &cond);
-    tbh(cond, rn, rm);
-  }
-  void Tbh(Register rn, Register rm) { Tbh(al, rn, rm); }
-
   void Teq(Condition cond, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     teq(cond, rn, operand);
   }
   void Teq(Register rn, const Operand& operand) { Teq(al, rn, operand); }
 
   void Tst(Condition cond, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     bool can_use_it =
         // TST{<c>}{<q>} <Rn>, <Rm> ; T1
         operand.IsPlainRegister() && rn.IsLow() &&
@@ -4016,27 +4892,36 @@ class MacroAssembler : public Assembler {
   void Tst(Register rn, const Operand& operand) { Tst(al, rn, operand); }
 
   void Uadd16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uadd16(cond, rd, rn, rm);
   }
   void Uadd16(Register rd, Register rn, Register rm) { Uadd16(al, rd, rn, rm); }
 
   void Uadd8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uadd8(cond, rd, rn, rm);
   }
   void Uadd8(Register rd, Register rn, Register rm) { Uadd8(al, rd, rn, rm); }
 
   void Uasx(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uasx(cond, rd, rn, rm);
   }
@@ -4047,9 +4932,12 @@ class MacroAssembler : public Assembler {
             Register rn,
             uint32_t lsb,
             const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     ubfx(cond, rd, rn, lsb, operand);
   }
@@ -4060,25 +4948,31 @@ class MacroAssembler : public Assembler {
   void Udf(Condition cond, uint32_t imm) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     udf(cond, imm);
   }
   void Udf(uint32_t imm) { Udf(al, imm); }
 
   void Udiv(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     udiv(cond, rd, rn, rm);
   }
   void Udiv(Register rd, Register rn, Register rm) { Udiv(al, rd, rn, rm); }
 
   void Uhadd16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uhadd16(cond, rd, rn, rm);
   }
@@ -4087,36 +4981,48 @@ class MacroAssembler : public Assembler {
   }
 
   void Uhadd8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uhadd8(cond, rd, rn, rm);
   }
   void Uhadd8(Register rd, Register rn, Register rm) { Uhadd8(al, rd, rn, rm); }
 
   void Uhasx(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uhasx(cond, rd, rn, rm);
   }
   void Uhasx(Register rd, Register rn, Register rm) { Uhasx(al, rd, rn, rm); }
 
   void Uhsax(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uhsax(cond, rd, rn, rm);
   }
   void Uhsax(Register rd, Register rn, Register rm) { Uhsax(al, rd, rn, rm); }
 
   void Uhsub16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uhsub16(cond, rd, rn, rm);
   }
@@ -4125,9 +5031,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Uhsub8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uhsub8(cond, rd, rn, rm);
   }
@@ -4135,9 +5044,13 @@ class MacroAssembler : public Assembler {
 
   void Umaal(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     umaal(cond, rdlo, rdhi, rn, rm);
   }
@@ -4147,9 +5060,13 @@ class MacroAssembler : public Assembler {
 
   void Umlal(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     umlal(cond, rdlo, rdhi, rn, rm);
   }
@@ -4184,9 +5101,13 @@ class MacroAssembler : public Assembler {
 
   void Umlals(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     umlals(cond, rdlo, rdhi, rn, rm);
   }
@@ -4196,9 +5117,13 @@ class MacroAssembler : public Assembler {
 
   void Umull(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     umull(cond, rdlo, rdhi, rn, rm);
   }
@@ -4233,9 +5158,13 @@ class MacroAssembler : public Assembler {
 
   void Umulls(
       Condition cond, Register rdlo, Register rdhi, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdlo));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rdhi));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     umulls(cond, rdlo, rdhi, rn, rm);
   }
@@ -4244,9 +5173,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Uqadd16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uqadd16(cond, rd, rn, rm);
   }
@@ -4255,36 +5187,48 @@ class MacroAssembler : public Assembler {
   }
 
   void Uqadd8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uqadd8(cond, rd, rn, rm);
   }
   void Uqadd8(Register rd, Register rn, Register rm) { Uqadd8(al, rd, rn, rm); }
 
   void Uqasx(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uqasx(cond, rd, rn, rm);
   }
   void Uqasx(Register rd, Register rn, Register rm) { Uqasx(al, rd, rn, rm); }
 
   void Uqsax(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uqsax(cond, rd, rn, rm);
   }
   void Uqsax(Register rd, Register rn, Register rm) { Uqsax(al, rd, rn, rm); }
 
   void Uqsub16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uqsub16(cond, rd, rn, rm);
   }
@@ -4293,18 +5237,24 @@ class MacroAssembler : public Assembler {
   }
 
   void Uqsub8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uqsub8(cond, rd, rn, rm);
   }
   void Uqsub8(Register rd, Register rn, Register rm) { Uqsub8(al, rd, rn, rm); }
 
   void Usad8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     usad8(cond, rd, rn, rm);
   }
@@ -4312,9 +5262,13 @@ class MacroAssembler : public Assembler {
 
   void Usada8(
       Condition cond, Register rd, Register rn, Register rm, Register ra) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(ra));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     usada8(cond, rd, rn, rm, ra);
   }
@@ -4323,9 +5277,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Usat(Condition cond, Register rd, uint32_t imm, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     usat(cond, rd, imm, operand);
   }
@@ -4334,9 +5290,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Usat16(Condition cond, Register rd, uint32_t imm, Register rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     usat16(cond, rd, imm, rn);
   }
@@ -4345,36 +5303,48 @@ class MacroAssembler : public Assembler {
   }
 
   void Usax(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     usax(cond, rd, rn, rm);
   }
   void Usax(Register rd, Register rn, Register rm) { Usax(al, rd, rn, rm); }
 
   void Usub16(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     usub16(cond, rd, rn, rm);
   }
   void Usub16(Register rd, Register rn, Register rm) { Usub16(al, rd, rn, rm); }
 
   void Usub8(Condition cond, Register rd, Register rn, Register rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     usub8(cond, rd, rn, rm);
   }
   void Usub8(Register rd, Register rn, Register rm) { Usub8(al, rd, rn, rm); }
 
   void Uxtab(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uxtab(cond, rd, rn, operand);
   }
@@ -4386,9 +5356,12 @@ class MacroAssembler : public Assembler {
                Register rd,
                Register rn,
                const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uxtab16(cond, rd, rn, operand);
   }
@@ -4397,9 +5370,12 @@ class MacroAssembler : public Assembler {
   }
 
   void Uxtah(Condition cond, Register rd, Register rn, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uxtah(cond, rd, rn, operand);
   }
@@ -4408,27 +5384,33 @@ class MacroAssembler : public Assembler {
   }
 
   void Uxtb(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uxtb(cond, rd, operand);
   }
   void Uxtb(Register rd, const Operand& operand) { Uxtb(al, rd, operand); }
 
   void Uxtb16(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uxtb16(cond, rd, operand);
   }
   void Uxtb16(Register rd, const Operand& operand) { Uxtb16(al, rd, operand); }
 
   void Uxth(Condition cond, Register rd, const Operand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     uxth(cond, rd, operand);
   }
@@ -4436,9 +5418,12 @@ class MacroAssembler : public Assembler {
 
   void Vaba(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vaba(cond, dt, rd, rn, rm);
   }
@@ -4448,9 +5433,12 @@ class MacroAssembler : public Assembler {
 
   void Vaba(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vaba(cond, dt, rd, rn, rm);
   }
@@ -4460,9 +5448,12 @@ class MacroAssembler : public Assembler {
 
   void Vabal(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vabal(cond, dt, rd, rn, rm);
   }
@@ -4472,9 +5463,12 @@ class MacroAssembler : public Assembler {
 
   void Vabd(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vabd(cond, dt, rd, rn, rm);
   }
@@ -4484,9 +5478,12 @@ class MacroAssembler : public Assembler {
 
   void Vabd(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vabd(cond, dt, rd, rn, rm);
   }
@@ -4496,9 +5493,12 @@ class MacroAssembler : public Assembler {
 
   void Vabdl(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vabdl(cond, dt, rd, rn, rm);
   }
@@ -4507,27 +5507,33 @@ class MacroAssembler : public Assembler {
   }
 
   void Vabs(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vabs(cond, dt, rd, rm);
   }
   void Vabs(DataType dt, DRegister rd, DRegister rm) { Vabs(al, dt, rd, rm); }
 
   void Vabs(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vabs(cond, dt, rd, rm);
   }
   void Vabs(DataType dt, QRegister rd, QRegister rm) { Vabs(al, dt, rd, rm); }
 
   void Vabs(Condition cond, DataType dt, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vabs(cond, dt, rd, rm);
   }
@@ -4535,9 +5541,12 @@ class MacroAssembler : public Assembler {
 
   void Vacge(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vacge(cond, dt, rd, rn, rm);
   }
@@ -4547,9 +5556,12 @@ class MacroAssembler : public Assembler {
 
   void Vacge(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vacge(cond, dt, rd, rn, rm);
   }
@@ -4559,9 +5571,12 @@ class MacroAssembler : public Assembler {
 
   void Vacgt(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vacgt(cond, dt, rd, rn, rm);
   }
@@ -4571,9 +5586,12 @@ class MacroAssembler : public Assembler {
 
   void Vacgt(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vacgt(cond, dt, rd, rn, rm);
   }
@@ -4583,9 +5601,12 @@ class MacroAssembler : public Assembler {
 
   void Vacle(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vacle(cond, dt, rd, rn, rm);
   }
@@ -4595,9 +5616,12 @@ class MacroAssembler : public Assembler {
 
   void Vacle(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vacle(cond, dt, rd, rn, rm);
   }
@@ -4607,9 +5631,12 @@ class MacroAssembler : public Assembler {
 
   void Vaclt(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vaclt(cond, dt, rd, rn, rm);
   }
@@ -4619,9 +5646,12 @@ class MacroAssembler : public Assembler {
 
   void Vaclt(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vaclt(cond, dt, rd, rn, rm);
   }
@@ -4631,9 +5661,12 @@ class MacroAssembler : public Assembler {
 
   void Vadd(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vadd(cond, dt, rd, rn, rm);
   }
@@ -4643,9 +5676,12 @@ class MacroAssembler : public Assembler {
 
   void Vadd(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vadd(cond, dt, rd, rn, rm);
   }
@@ -4655,9 +5691,12 @@ class MacroAssembler : public Assembler {
 
   void Vadd(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vadd(cond, dt, rd, rn, rm);
   }
@@ -4667,9 +5706,12 @@ class MacroAssembler : public Assembler {
 
   void Vaddhn(
       Condition cond, DataType dt, DRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vaddhn(cond, dt, rd, rn, rm);
   }
@@ -4679,9 +5721,12 @@ class MacroAssembler : public Assembler {
 
   void Vaddl(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vaddl(cond, dt, rd, rn, rm);
   }
@@ -4691,9 +5736,12 @@ class MacroAssembler : public Assembler {
 
   void Vaddw(
       Condition cond, DataType dt, QRegister rd, QRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vaddw(cond, dt, rd, rn, rm);
   }
@@ -4706,9 +5754,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rn,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vand(cond, dt, rd, rn, operand);
   }
@@ -4721,9 +5772,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rn,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vand(cond, dt, rd, rn, operand);
   }
@@ -4736,9 +5790,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rn,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vbic(cond, dt, rd, rn, operand);
   }
@@ -4751,9 +5808,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rn,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vbic(cond, dt, rd, rn, operand);
   }
@@ -4763,9 +5823,12 @@ class MacroAssembler : public Assembler {
 
   void Vbif(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vbif(cond, dt, rd, rn, rm);
   }
@@ -4781,9 +5844,12 @@ class MacroAssembler : public Assembler {
 
   void Vbif(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vbif(cond, dt, rd, rn, rm);
   }
@@ -4799,9 +5865,12 @@ class MacroAssembler : public Assembler {
 
   void Vbit(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vbit(cond, dt, rd, rn, rm);
   }
@@ -4817,9 +5886,12 @@ class MacroAssembler : public Assembler {
 
   void Vbit(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vbit(cond, dt, rd, rn, rm);
   }
@@ -4835,9 +5907,12 @@ class MacroAssembler : public Assembler {
 
   void Vbsl(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vbsl(cond, dt, rd, rn, rm);
   }
@@ -4853,9 +5928,12 @@ class MacroAssembler : public Assembler {
 
   void Vbsl(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vbsl(cond, dt, rd, rn, rm);
   }
@@ -4874,9 +5952,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vceq(cond, dt, rd, rm, operand);
   }
@@ -4889,9 +5970,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vceq(cond, dt, rd, rm, operand);
   }
@@ -4901,9 +5985,12 @@ class MacroAssembler : public Assembler {
 
   void Vceq(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vceq(cond, dt, rd, rn, rm);
   }
@@ -4913,9 +6000,12 @@ class MacroAssembler : public Assembler {
 
   void Vceq(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vceq(cond, dt, rd, rn, rm);
   }
@@ -4928,9 +6018,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcge(cond, dt, rd, rm, operand);
   }
@@ -4943,9 +6036,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcge(cond, dt, rd, rm, operand);
   }
@@ -4955,9 +6051,12 @@ class MacroAssembler : public Assembler {
 
   void Vcge(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcge(cond, dt, rd, rn, rm);
   }
@@ -4967,9 +6066,12 @@ class MacroAssembler : public Assembler {
 
   void Vcge(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcge(cond, dt, rd, rn, rm);
   }
@@ -4982,9 +6084,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcgt(cond, dt, rd, rm, operand);
   }
@@ -4997,9 +6102,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcgt(cond, dt, rd, rm, operand);
   }
@@ -5009,9 +6117,12 @@ class MacroAssembler : public Assembler {
 
   void Vcgt(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcgt(cond, dt, rd, rn, rm);
   }
@@ -5021,9 +6132,12 @@ class MacroAssembler : public Assembler {
 
   void Vcgt(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcgt(cond, dt, rd, rn, rm);
   }
@@ -5036,9 +6150,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcle(cond, dt, rd, rm, operand);
   }
@@ -5051,9 +6168,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcle(cond, dt, rd, rm, operand);
   }
@@ -5063,9 +6183,12 @@ class MacroAssembler : public Assembler {
 
   void Vcle(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcle(cond, dt, rd, rn, rm);
   }
@@ -5075,9 +6198,12 @@ class MacroAssembler : public Assembler {
 
   void Vcle(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcle(cond, dt, rd, rn, rm);
   }
@@ -5086,18 +6212,22 @@ class MacroAssembler : public Assembler {
   }
 
   void Vcls(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcls(cond, dt, rd, rm);
   }
   void Vcls(DataType dt, DRegister rd, DRegister rm) { Vcls(al, dt, rd, rm); }
 
   void Vcls(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcls(cond, dt, rd, rm);
   }
@@ -5108,9 +6238,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vclt(cond, dt, rd, rm, operand);
   }
@@ -5123,9 +6256,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vclt(cond, dt, rd, rm, operand);
   }
@@ -5135,9 +6271,12 @@ class MacroAssembler : public Assembler {
 
   void Vclt(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vclt(cond, dt, rd, rn, rm);
   }
@@ -5147,9 +6286,12 @@ class MacroAssembler : public Assembler {
 
   void Vclt(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vclt(cond, dt, rd, rn, rm);
   }
@@ -5158,108 +6300,128 @@ class MacroAssembler : public Assembler {
   }
 
   void Vclz(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vclz(cond, dt, rd, rm);
   }
   void Vclz(DataType dt, DRegister rd, DRegister rm) { Vclz(al, dt, rd, rm); }
 
   void Vclz(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vclz(cond, dt, rd, rm);
   }
   void Vclz(DataType dt, QRegister rd, QRegister rm) { Vclz(al, dt, rd, rm); }
 
   void Vcmp(Condition cond, DataType dt, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcmp(cond, dt, rd, rm);
   }
   void Vcmp(DataType dt, SRegister rd, SRegister rm) { Vcmp(al, dt, rd, rm); }
 
   void Vcmp(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcmp(cond, dt, rd, rm);
   }
   void Vcmp(DataType dt, DRegister rd, DRegister rm) { Vcmp(al, dt, rd, rm); }
 
   void Vcmp(Condition cond, DataType dt, SRegister rd, double imm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcmp(cond, dt, rd, imm);
   }
   void Vcmp(DataType dt, SRegister rd, double imm) { Vcmp(al, dt, rd, imm); }
 
   void Vcmp(Condition cond, DataType dt, DRegister rd, double imm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcmp(cond, dt, rd, imm);
   }
   void Vcmp(DataType dt, DRegister rd, double imm) { Vcmp(al, dt, rd, imm); }
 
   void Vcmpe(Condition cond, DataType dt, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcmpe(cond, dt, rd, rm);
   }
   void Vcmpe(DataType dt, SRegister rd, SRegister rm) { Vcmpe(al, dt, rd, rm); }
 
   void Vcmpe(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcmpe(cond, dt, rd, rm);
   }
   void Vcmpe(DataType dt, DRegister rd, DRegister rm) { Vcmpe(al, dt, rd, rm); }
 
   void Vcmpe(Condition cond, DataType dt, SRegister rd, double imm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcmpe(cond, dt, rd, imm);
   }
   void Vcmpe(DataType dt, SRegister rd, double imm) { Vcmpe(al, dt, rd, imm); }
 
   void Vcmpe(Condition cond, DataType dt, DRegister rd, double imm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcmpe(cond, dt, rd, imm);
   }
   void Vcmpe(DataType dt, DRegister rd, double imm) { Vcmpe(al, dt, rd, imm); }
 
   void Vcnt(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcnt(cond, dt, rd, rm);
   }
   void Vcnt(DataType dt, DRegister rd, DRegister rm) { Vcnt(al, dt, rd, rm); }
 
   void Vcnt(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcnt(cond, dt, rd, rm);
   }
@@ -5267,9 +6429,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvt(
       Condition cond, DataType dt1, DataType dt2, DRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm);
   }
@@ -5279,9 +6443,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvt(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm);
   }
@@ -5295,9 +6461,11 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             int32_t fbits) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm, fbits);
   }
@@ -5312,9 +6480,11 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             int32_t fbits) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm, fbits);
   }
@@ -5329,9 +6499,11 @@ class MacroAssembler : public Assembler {
             SRegister rd,
             SRegister rm,
             int32_t fbits) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm, fbits);
   }
@@ -5342,9 +6514,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvt(
       Condition cond, DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm);
   }
@@ -5354,9 +6528,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvt(
       Condition cond, DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm);
   }
@@ -5366,9 +6542,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvt(
       Condition cond, DataType dt1, DataType dt2, DRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm);
   }
@@ -5378,9 +6556,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvt(
       Condition cond, DataType dt1, DataType dt2, QRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm);
   }
@@ -5390,9 +6570,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvt(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvt(cond, dt1, dt2, rd, rm);
   }
@@ -5401,38 +6583,48 @@ class MacroAssembler : public Assembler {
   }
 
   void Vcvta(DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvta(dt1, dt2, rd, rm);
   }
 
   void Vcvta(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvta(dt1, dt2, rd, rm);
   }
 
   void Vcvta(DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvta(dt1, dt2, rd, rm);
   }
 
   void Vcvta(DataType dt1, DataType dt2, SRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvta(dt1, dt2, rd, rm);
   }
 
   void Vcvtb(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvtb(cond, dt1, dt2, rd, rm);
   }
@@ -5442,9 +6634,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvtb(
       Condition cond, DataType dt1, DataType dt2, DRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvtb(cond, dt1, dt2, rd, rm);
   }
@@ -5454,9 +6648,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvtb(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvtb(cond, dt1, dt2, rd, rm);
   }
@@ -5465,94 +6661,120 @@ class MacroAssembler : public Assembler {
   }
 
   void Vcvtm(DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtm(dt1, dt2, rd, rm);
   }
 
   void Vcvtm(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtm(dt1, dt2, rd, rm);
   }
 
   void Vcvtm(DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtm(dt1, dt2, rd, rm);
   }
 
   void Vcvtm(DataType dt1, DataType dt2, SRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtm(dt1, dt2, rd, rm);
   }
 
   void Vcvtn(DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtn(dt1, dt2, rd, rm);
   }
 
   void Vcvtn(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtn(dt1, dt2, rd, rm);
   }
 
   void Vcvtn(DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtn(dt1, dt2, rd, rm);
   }
 
   void Vcvtn(DataType dt1, DataType dt2, SRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtn(dt1, dt2, rd, rm);
   }
 
   void Vcvtp(DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtp(dt1, dt2, rd, rm);
   }
 
   void Vcvtp(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtp(dt1, dt2, rd, rm);
   }
 
   void Vcvtp(DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtp(dt1, dt2, rd, rm);
   }
 
   void Vcvtp(DataType dt1, DataType dt2, SRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vcvtp(dt1, dt2, rd, rm);
   }
 
   void Vcvtr(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvtr(cond, dt1, dt2, rd, rm);
   }
@@ -5562,9 +6784,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvtr(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvtr(cond, dt1, dt2, rd, rm);
   }
@@ -5574,9 +6798,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvtt(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvtt(cond, dt1, dt2, rd, rm);
   }
@@ -5586,9 +6812,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvtt(
       Condition cond, DataType dt1, DataType dt2, DRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvtt(cond, dt1, dt2, rd, rm);
   }
@@ -5598,9 +6826,11 @@ class MacroAssembler : public Assembler {
 
   void Vcvtt(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vcvtt(cond, dt1, dt2, rd, rm);
   }
@@ -5610,9 +6840,12 @@ class MacroAssembler : public Assembler {
 
   void Vdiv(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vdiv(cond, dt, rd, rn, rm);
   }
@@ -5622,9 +6855,12 @@ class MacroAssembler : public Assembler {
 
   void Vdiv(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vdiv(cond, dt, rd, rn, rm);
   }
@@ -5633,27 +6869,33 @@ class MacroAssembler : public Assembler {
   }
 
   void Vdup(Condition cond, DataType dt, QRegister rd, Register rt) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vdup(cond, dt, rd, rt);
   }
   void Vdup(DataType dt, QRegister rd, Register rt) { Vdup(al, dt, rd, rt); }
 
   void Vdup(Condition cond, DataType dt, DRegister rd, Register rt) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vdup(cond, dt, rd, rt);
   }
   void Vdup(DataType dt, DRegister rd, Register rt) { Vdup(al, dt, rd, rt); }
 
   void Vdup(Condition cond, DataType dt, DRegister rd, DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vdup(cond, dt, rd, rm);
   }
@@ -5662,9 +6904,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vdup(Condition cond, DataType dt, QRegister rd, DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vdup(cond, dt, rd, rm);
   }
@@ -5674,9 +6918,12 @@ class MacroAssembler : public Assembler {
 
   void Veor(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     veor(cond, dt, rd, rn, rm);
   }
@@ -5692,9 +6939,12 @@ class MacroAssembler : public Assembler {
 
   void Veor(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     veor(cond, dt, rd, rn, rm);
   }
@@ -5714,9 +6964,13 @@ class MacroAssembler : public Assembler {
             DRegister rn,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vext(cond, dt, rd, rn, rm, operand);
   }
@@ -5734,9 +6988,13 @@ class MacroAssembler : public Assembler {
             QRegister rn,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vext(cond, dt, rd, rn, rm, operand);
   }
@@ -5750,9 +7008,12 @@ class MacroAssembler : public Assembler {
 
   void Vfma(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfma(cond, dt, rd, rn, rm);
   }
@@ -5762,9 +7023,12 @@ class MacroAssembler : public Assembler {
 
   void Vfma(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfma(cond, dt, rd, rn, rm);
   }
@@ -5774,9 +7038,12 @@ class MacroAssembler : public Assembler {
 
   void Vfma(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfma(cond, dt, rd, rn, rm);
   }
@@ -5786,9 +7053,12 @@ class MacroAssembler : public Assembler {
 
   void Vfms(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfms(cond, dt, rd, rn, rm);
   }
@@ -5798,9 +7068,12 @@ class MacroAssembler : public Assembler {
 
   void Vfms(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfms(cond, dt, rd, rn, rm);
   }
@@ -5810,9 +7083,12 @@ class MacroAssembler : public Assembler {
 
   void Vfms(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfms(cond, dt, rd, rn, rm);
   }
@@ -5822,9 +7098,12 @@ class MacroAssembler : public Assembler {
 
   void Vfnma(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfnma(cond, dt, rd, rn, rm);
   }
@@ -5834,9 +7113,12 @@ class MacroAssembler : public Assembler {
 
   void Vfnma(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfnma(cond, dt, rd, rn, rm);
   }
@@ -5846,9 +7128,12 @@ class MacroAssembler : public Assembler {
 
   void Vfnms(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfnms(cond, dt, rd, rn, rm);
   }
@@ -5858,9 +7143,12 @@ class MacroAssembler : public Assembler {
 
   void Vfnms(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vfnms(cond, dt, rd, rn, rm);
   }
@@ -5870,9 +7158,12 @@ class MacroAssembler : public Assembler {
 
   void Vhadd(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vhadd(cond, dt, rd, rn, rm);
   }
@@ -5882,9 +7173,12 @@ class MacroAssembler : public Assembler {
 
   void Vhadd(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vhadd(cond, dt, rd, rn, rm);
   }
@@ -5894,9 +7188,12 @@ class MacroAssembler : public Assembler {
 
   void Vhsub(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vhsub(cond, dt, rd, rn, rm);
   }
@@ -5906,9 +7203,12 @@ class MacroAssembler : public Assembler {
 
   void Vhsub(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vhsub(cond, dt, rd, rn, rm);
   }
@@ -5920,9 +7220,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const AlignedMemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vld1(cond, dt, nreglist, operand);
   }
@@ -5936,9 +7238,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const AlignedMemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vld2(cond, dt, nreglist, operand);
   }
@@ -5952,9 +7256,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const AlignedMemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vld3(cond, dt, nreglist, operand);
   }
@@ -5968,9 +7274,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vld3(cond, dt, nreglist, operand);
   }
@@ -5984,9 +7292,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const AlignedMemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vld4(cond, dt, nreglist, operand);
   }
@@ -6001,9 +7311,11 @@ class MacroAssembler : public Assembler {
             Register rn,
             WriteBack write_back,
             DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldm(cond, dt, rn, write_back, dreglist);
   }
@@ -6028,9 +7340,11 @@ class MacroAssembler : public Assembler {
             Register rn,
             WriteBack write_back,
             SRegisterList sreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(sreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldm(cond, dt, rn, write_back, sreglist);
   }
@@ -6055,9 +7369,11 @@ class MacroAssembler : public Assembler {
               Register rn,
               WriteBack write_back,
               DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldmdb(cond, dt, rn, write_back, dreglist);
   }
@@ -6082,9 +7398,11 @@ class MacroAssembler : public Assembler {
               Register rn,
               WriteBack write_back,
               SRegisterList sreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(sreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldmdb(cond, dt, rn, write_back, sreglist);
   }
@@ -6109,9 +7427,11 @@ class MacroAssembler : public Assembler {
               Register rn,
               WriteBack write_back,
               DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldmia(cond, dt, rn, write_back, dreglist);
   }
@@ -6136,9 +7456,11 @@ class MacroAssembler : public Assembler {
               Register rn,
               WriteBack write_back,
               SRegisterList sreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(sreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldmia(cond, dt, rn, write_back, sreglist);
   }
@@ -6159,9 +7481,10 @@ class MacroAssembler : public Assembler {
   }
 
   void Vldr(Condition cond, DataType dt, DRegister rd, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldr(cond, dt, rd, label);
   }
@@ -6177,9 +7500,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             DRegister rd,
             const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldr(cond, dt, rd, operand);
   }
@@ -6194,9 +7519,10 @@ class MacroAssembler : public Assembler {
   }
 
   void Vldr(Condition cond, DataType dt, SRegister rd, Label* label) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldr(cond, dt, rd, label);
   }
@@ -6212,9 +7538,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             SRegister rd,
             const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vldr(cond, dt, rd, operand);
   }
@@ -6230,9 +7558,12 @@ class MacroAssembler : public Assembler {
 
   void Vmax(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmax(cond, dt, rd, rn, rm);
   }
@@ -6242,9 +7573,12 @@ class MacroAssembler : public Assembler {
 
   void Vmax(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmax(cond, dt, rd, rn, rm);
   }
@@ -6253,31 +7587,43 @@ class MacroAssembler : public Assembler {
   }
 
   void Vmaxnm(DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vmaxnm(dt, rd, rn, rm);
   }
 
   void Vmaxnm(DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vmaxnm(dt, rd, rn, rm);
   }
 
   void Vmaxnm(DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vmaxnm(dt, rd, rn, rm);
   }
 
   void Vmin(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmin(cond, dt, rd, rn, rm);
   }
@@ -6287,9 +7633,12 @@ class MacroAssembler : public Assembler {
 
   void Vmin(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmin(cond, dt, rd, rn, rm);
   }
@@ -6298,23 +7647,32 @@ class MacroAssembler : public Assembler {
   }
 
   void Vminnm(DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vminnm(dt, rd, rn, rm);
   }
 
   void Vminnm(DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vminnm(dt, rd, rn, rm);
   }
 
   void Vminnm(DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vminnm(dt, rd, rn, rm);
   }
 
@@ -6323,9 +7681,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rn,
             DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmla(cond, dt, rd, rn, rm);
   }
@@ -6338,9 +7699,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rn,
             DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmla(cond, dt, rd, rn, rm);
   }
@@ -6350,9 +7714,12 @@ class MacroAssembler : public Assembler {
 
   void Vmla(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmla(cond, dt, rd, rn, rm);
   }
@@ -6362,9 +7729,12 @@ class MacroAssembler : public Assembler {
 
   void Vmla(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmla(cond, dt, rd, rn, rm);
   }
@@ -6374,9 +7744,12 @@ class MacroAssembler : public Assembler {
 
   void Vmla(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmla(cond, dt, rd, rn, rm);
   }
@@ -6389,9 +7762,12 @@ class MacroAssembler : public Assembler {
              QRegister rd,
              DRegister rn,
              DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmlal(cond, dt, rd, rn, rm);
   }
@@ -6401,9 +7777,12 @@ class MacroAssembler : public Assembler {
 
   void Vmlal(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmlal(cond, dt, rd, rn, rm);
   }
@@ -6416,9 +7795,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rn,
             DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmls(cond, dt, rd, rn, rm);
   }
@@ -6431,9 +7813,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rn,
             DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmls(cond, dt, rd, rn, rm);
   }
@@ -6443,9 +7828,12 @@ class MacroAssembler : public Assembler {
 
   void Vmls(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmls(cond, dt, rd, rn, rm);
   }
@@ -6455,9 +7843,12 @@ class MacroAssembler : public Assembler {
 
   void Vmls(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmls(cond, dt, rd, rn, rm);
   }
@@ -6467,9 +7858,12 @@ class MacroAssembler : public Assembler {
 
   void Vmls(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmls(cond, dt, rd, rn, rm);
   }
@@ -6482,9 +7876,12 @@ class MacroAssembler : public Assembler {
              QRegister rd,
              DRegister rn,
              DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmlsl(cond, dt, rd, rn, rm);
   }
@@ -6494,9 +7891,12 @@ class MacroAssembler : public Assembler {
 
   void Vmlsl(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmlsl(cond, dt, rd, rn, rm);
   }
@@ -6505,36 +7905,46 @@ class MacroAssembler : public Assembler {
   }
 
   void Vmov(Condition cond, Register rt, SRegister rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, rt, rn);
   }
   void Vmov(Register rt, SRegister rn) { Vmov(al, rt, rn); }
 
   void Vmov(Condition cond, SRegister rn, Register rt) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, rn, rt);
   }
   void Vmov(SRegister rn, Register rt) { Vmov(al, rn, rt); }
 
   void Vmov(Condition cond, Register rt, Register rt2, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, rt, rt2, rm);
   }
   void Vmov(Register rt, Register rt2, DRegister rm) { Vmov(al, rt, rt2, rm); }
 
   void Vmov(Condition cond, DRegister rm, Register rt, Register rt2) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, rm, rt, rt2);
   }
@@ -6542,9 +7952,13 @@ class MacroAssembler : public Assembler {
 
   void Vmov(
       Condition cond, Register rt, Register rt2, SRegister rm, SRegister rm1) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm1));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, rt, rt2, rm, rm1);
   }
@@ -6554,9 +7968,13 @@ class MacroAssembler : public Assembler {
 
   void Vmov(
       Condition cond, SRegister rm, SRegister rm1, Register rt, Register rt2) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm1));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt2));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, rm, rm1, rt, rt2);
   }
@@ -6565,9 +7983,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vmov(Condition cond, DataType dt, DRegisterLane rd, Register rt) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, dt, rd, rt);
   }
@@ -6585,9 +8005,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             DRegister rd,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, dt, rd, operand);
   }
@@ -6599,9 +8021,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             QRegister rd,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, dt, rd, operand);
   }
@@ -6613,9 +8037,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             SRegister rd,
             const SOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, dt, rd, operand);
   }
@@ -6624,9 +8050,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vmov(Condition cond, DataType dt, Register rt, DRegisterLane rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmov(cond, dt, rt, rn);
   }
@@ -6641,18 +8069,22 @@ class MacroAssembler : public Assembler {
   }
 
   void Vmovl(Condition cond, DataType dt, QRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmovl(cond, dt, rd, rm);
   }
   void Vmovl(DataType dt, QRegister rd, DRegister rm) { Vmovl(al, dt, rd, rm); }
 
   void Vmovn(Condition cond, DataType dt, DRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmovn(cond, dt, rd, rm);
   }
@@ -6661,9 +8093,10 @@ class MacroAssembler : public Assembler {
   void Vmrs(Condition cond,
             RegisterOrAPSR_nzcv rt,
             SpecialFPRegister spec_reg) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmrs(cond, rt, spec_reg);
   }
@@ -6672,9 +8105,10 @@ class MacroAssembler : public Assembler {
   }
 
   void Vmsr(Condition cond, SpecialFPRegister spec_reg, Register rt) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rt));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmsr(cond, spec_reg, rt);
   }
@@ -6686,9 +8120,12 @@ class MacroAssembler : public Assembler {
             DRegister rn,
             DRegister dm,
             unsigned index) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmul(cond, dt, rd, rn, dm, index);
   }
@@ -6703,9 +8140,12 @@ class MacroAssembler : public Assembler {
             QRegister rn,
             DRegister dm,
             unsigned index) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmul(cond, dt, rd, rn, dm, index);
   }
@@ -6716,9 +8156,12 @@ class MacroAssembler : public Assembler {
 
   void Vmul(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmul(cond, dt, rd, rn, rm);
   }
@@ -6728,9 +8171,12 @@ class MacroAssembler : public Assembler {
 
   void Vmul(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmul(cond, dt, rd, rn, rm);
   }
@@ -6740,9 +8186,12 @@ class MacroAssembler : public Assembler {
 
   void Vmul(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmul(cond, dt, rd, rn, rm);
   }
@@ -6756,9 +8205,12 @@ class MacroAssembler : public Assembler {
              DRegister rn,
              DRegister dm,
              unsigned index) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmull(cond, dt, rd, rn, dm, index);
   }
@@ -6769,9 +8221,12 @@ class MacroAssembler : public Assembler {
 
   void Vmull(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmull(cond, dt, rd, rn, rm);
   }
@@ -6783,9 +8238,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             DRegister rd,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmvn(cond, dt, rd, operand);
   }
@@ -6797,9 +8254,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             QRegister rd,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vmvn(cond, dt, rd, operand);
   }
@@ -6808,27 +8267,33 @@ class MacroAssembler : public Assembler {
   }
 
   void Vneg(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vneg(cond, dt, rd, rm);
   }
   void Vneg(DataType dt, DRegister rd, DRegister rm) { Vneg(al, dt, rd, rm); }
 
   void Vneg(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vneg(cond, dt, rd, rm);
   }
   void Vneg(DataType dt, QRegister rd, QRegister rm) { Vneg(al, dt, rd, rm); }
 
   void Vneg(Condition cond, DataType dt, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vneg(cond, dt, rd, rm);
   }
@@ -6836,9 +8301,12 @@ class MacroAssembler : public Assembler {
 
   void Vnmla(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vnmla(cond, dt, rd, rn, rm);
   }
@@ -6848,9 +8316,12 @@ class MacroAssembler : public Assembler {
 
   void Vnmla(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vnmla(cond, dt, rd, rn, rm);
   }
@@ -6860,9 +8331,12 @@ class MacroAssembler : public Assembler {
 
   void Vnmls(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vnmls(cond, dt, rd, rn, rm);
   }
@@ -6872,9 +8346,12 @@ class MacroAssembler : public Assembler {
 
   void Vnmls(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vnmls(cond, dt, rd, rn, rm);
   }
@@ -6884,9 +8361,12 @@ class MacroAssembler : public Assembler {
 
   void Vnmul(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vnmul(cond, dt, rd, rn, rm);
   }
@@ -6896,9 +8376,12 @@ class MacroAssembler : public Assembler {
 
   void Vnmul(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vnmul(cond, dt, rd, rn, rm);
   }
@@ -6911,9 +8394,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rn,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vorn(cond, dt, rd, rn, operand);
   }
@@ -6926,9 +8412,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rn,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vorn(cond, dt, rd, rn, operand);
   }
@@ -6941,9 +8430,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rn,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vorr(cond, dt, rd, rn, operand);
   }
@@ -6965,9 +8457,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rn,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vorr(cond, dt, rd, rn, operand);
   }
@@ -6985,9 +8480,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vpadal(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpadal(cond, dt, rd, rm);
   }
@@ -6996,9 +8493,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vpadal(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpadal(cond, dt, rd, rm);
   }
@@ -7008,9 +8507,12 @@ class MacroAssembler : public Assembler {
 
   void Vpadd(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpadd(cond, dt, rd, rn, rm);
   }
@@ -7019,9 +8521,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vpaddl(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpaddl(cond, dt, rd, rm);
   }
@@ -7030,9 +8534,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vpaddl(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpaddl(cond, dt, rd, rm);
   }
@@ -7042,9 +8548,12 @@ class MacroAssembler : public Assembler {
 
   void Vpmax(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpmax(cond, dt, rd, rn, rm);
   }
@@ -7054,9 +8563,12 @@ class MacroAssembler : public Assembler {
 
   void Vpmin(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpmin(cond, dt, rd, rn, rm);
   }
@@ -7065,9 +8577,10 @@ class MacroAssembler : public Assembler {
   }
 
   void Vpop(Condition cond, DataType dt, DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpop(cond, dt, dreglist);
   }
@@ -7078,9 +8591,10 @@ class MacroAssembler : public Assembler {
   void Vpop(DRegisterList dreglist) { Vpop(al, kDataTypeValueNone, dreglist); }
 
   void Vpop(Condition cond, DataType dt, SRegisterList sreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(sreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpop(cond, dt, sreglist);
   }
@@ -7091,9 +8605,10 @@ class MacroAssembler : public Assembler {
   void Vpop(SRegisterList sreglist) { Vpop(al, kDataTypeValueNone, sreglist); }
 
   void Vpush(Condition cond, DataType dt, DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpush(cond, dt, dreglist);
   }
@@ -7106,9 +8621,10 @@ class MacroAssembler : public Assembler {
   }
 
   void Vpush(Condition cond, DataType dt, SRegisterList sreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(sreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vpush(cond, dt, sreglist);
   }
@@ -7121,18 +8637,22 @@ class MacroAssembler : public Assembler {
   }
 
   void Vqabs(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqabs(cond, dt, rd, rm);
   }
   void Vqabs(DataType dt, DRegister rd, DRegister rm) { Vqabs(al, dt, rd, rm); }
 
   void Vqabs(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqabs(cond, dt, rd, rm);
   }
@@ -7140,9 +8660,12 @@ class MacroAssembler : public Assembler {
 
   void Vqadd(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqadd(cond, dt, rd, rn, rm);
   }
@@ -7152,9 +8675,12 @@ class MacroAssembler : public Assembler {
 
   void Vqadd(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqadd(cond, dt, rd, rn, rm);
   }
@@ -7164,9 +8690,12 @@ class MacroAssembler : public Assembler {
 
   void Vqdmlal(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmlal(cond, dt, rd, rn, rm);
   }
@@ -7180,9 +8709,12 @@ class MacroAssembler : public Assembler {
                DRegister rn,
                DRegister dm,
                unsigned index) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmlal(cond, dt, rd, rn, dm, index);
   }
@@ -7193,9 +8725,12 @@ class MacroAssembler : public Assembler {
 
   void Vqdmlsl(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmlsl(cond, dt, rd, rn, rm);
   }
@@ -7209,9 +8744,12 @@ class MacroAssembler : public Assembler {
                DRegister rn,
                DRegister dm,
                unsigned index) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmlsl(cond, dt, rd, rn, dm, index);
   }
@@ -7222,9 +8760,12 @@ class MacroAssembler : public Assembler {
 
   void Vqdmulh(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmulh(cond, dt, rd, rn, rm);
   }
@@ -7234,9 +8775,12 @@ class MacroAssembler : public Assembler {
 
   void Vqdmulh(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmulh(cond, dt, rd, rn, rm);
   }
@@ -7249,9 +8793,12 @@ class MacroAssembler : public Assembler {
                DRegister rd,
                DRegister rn,
                DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmulh(cond, dt, rd, rn, rm);
   }
@@ -7264,9 +8811,12 @@ class MacroAssembler : public Assembler {
                QRegister rd,
                QRegister rn,
                DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmulh(cond, dt, rd, rn, rm);
   }
@@ -7276,9 +8826,12 @@ class MacroAssembler : public Assembler {
 
   void Vqdmull(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmull(cond, dt, rd, rn, rm);
   }
@@ -7291,9 +8844,12 @@ class MacroAssembler : public Assembler {
                QRegister rd,
                DRegister rn,
                DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqdmull(cond, dt, rd, rn, rm);
   }
@@ -7302,9 +8858,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vqmovn(Condition cond, DataType dt, DRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqmovn(cond, dt, rd, rm);
   }
@@ -7313,9 +8871,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vqmovun(Condition cond, DataType dt, DRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqmovun(cond, dt, rd, rm);
   }
@@ -7324,18 +8884,22 @@ class MacroAssembler : public Assembler {
   }
 
   void Vqneg(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqneg(cond, dt, rd, rm);
   }
   void Vqneg(DataType dt, DRegister rd, DRegister rm) { Vqneg(al, dt, rd, rm); }
 
   void Vqneg(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqneg(cond, dt, rd, rm);
   }
@@ -7343,9 +8907,12 @@ class MacroAssembler : public Assembler {
 
   void Vqrdmulh(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqrdmulh(cond, dt, rd, rn, rm);
   }
@@ -7355,9 +8922,12 @@ class MacroAssembler : public Assembler {
 
   void Vqrdmulh(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqrdmulh(cond, dt, rd, rn, rm);
   }
@@ -7370,9 +8940,12 @@ class MacroAssembler : public Assembler {
                 DRegister rd,
                 DRegister rn,
                 DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqrdmulh(cond, dt, rd, rn, rm);
   }
@@ -7385,9 +8958,12 @@ class MacroAssembler : public Assembler {
                 QRegister rd,
                 QRegister rn,
                 DRegisterLane rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqrdmulh(cond, dt, rd, rn, rm);
   }
@@ -7397,9 +8973,12 @@ class MacroAssembler : public Assembler {
 
   void Vqrshl(
       Condition cond, DataType dt, DRegister rd, DRegister rm, DRegister rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqrshl(cond, dt, rd, rm, rn);
   }
@@ -7409,9 +8988,12 @@ class MacroAssembler : public Assembler {
 
   void Vqrshl(
       Condition cond, DataType dt, QRegister rd, QRegister rm, QRegister rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqrshl(cond, dt, rd, rm, rn);
   }
@@ -7424,9 +9006,12 @@ class MacroAssembler : public Assembler {
                DRegister rd,
                QRegister rm,
                const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqrshrn(cond, dt, rd, rm, operand);
   }
@@ -7442,9 +9027,12 @@ class MacroAssembler : public Assembler {
                 DRegister rd,
                 QRegister rm,
                 const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqrshrun(cond, dt, rd, rm, operand);
   }
@@ -7460,9 +9048,12 @@ class MacroAssembler : public Assembler {
              DRegister rd,
              DRegister rm,
              const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqshl(cond, dt, rd, rm, operand);
   }
@@ -7475,9 +9066,12 @@ class MacroAssembler : public Assembler {
              QRegister rd,
              QRegister rm,
              const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqshl(cond, dt, rd, rm, operand);
   }
@@ -7490,9 +9084,12 @@ class MacroAssembler : public Assembler {
               DRegister rd,
               DRegister rm,
               const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqshlu(cond, dt, rd, rm, operand);
   }
@@ -7508,9 +9105,12 @@ class MacroAssembler : public Assembler {
               QRegister rd,
               QRegister rm,
               const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqshlu(cond, dt, rd, rm, operand);
   }
@@ -7526,9 +9126,12 @@ class MacroAssembler : public Assembler {
               DRegister rd,
               QRegister rm,
               const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqshrn(cond, dt, rd, rm, operand);
   }
@@ -7544,9 +9147,12 @@ class MacroAssembler : public Assembler {
                DRegister rd,
                QRegister rm,
                const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqshrun(cond, dt, rd, rm, operand);
   }
@@ -7559,9 +9165,12 @@ class MacroAssembler : public Assembler {
 
   void Vqsub(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqsub(cond, dt, rd, rn, rm);
   }
@@ -7571,9 +9180,12 @@ class MacroAssembler : public Assembler {
 
   void Vqsub(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vqsub(cond, dt, rd, rn, rm);
   }
@@ -7583,9 +9195,12 @@ class MacroAssembler : public Assembler {
 
   void Vraddhn(
       Condition cond, DataType dt, DRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vraddhn(cond, dt, rd, rn, rm);
   }
@@ -7594,9 +9209,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrecpe(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrecpe(cond, dt, rd, rm);
   }
@@ -7605,9 +9222,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrecpe(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrecpe(cond, dt, rd, rm);
   }
@@ -7617,9 +9236,12 @@ class MacroAssembler : public Assembler {
 
   void Vrecps(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrecps(cond, dt, rd, rn, rm);
   }
@@ -7629,9 +9251,12 @@ class MacroAssembler : public Assembler {
 
   void Vrecps(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrecps(cond, dt, rd, rn, rm);
   }
@@ -7640,9 +9265,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrev16(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrev16(cond, dt, rd, rm);
   }
@@ -7651,9 +9278,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrev16(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrev16(cond, dt, rd, rm);
   }
@@ -7662,9 +9291,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrev32(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrev32(cond, dt, rd, rm);
   }
@@ -7673,9 +9304,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrev32(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrev32(cond, dt, rd, rm);
   }
@@ -7684,9 +9317,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrev64(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrev64(cond, dt, rd, rm);
   }
@@ -7695,9 +9330,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrev64(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrev64(cond, dt, rd, rm);
   }
@@ -7707,9 +9344,12 @@ class MacroAssembler : public Assembler {
 
   void Vrhadd(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrhadd(cond, dt, rd, rn, rm);
   }
@@ -7719,9 +9359,12 @@ class MacroAssembler : public Assembler {
 
   void Vrhadd(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrhadd(cond, dt, rd, rn, rm);
   }
@@ -7730,94 +9373,120 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrinta(DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrinta(dt1, dt2, rd, rm);
   }
 
   void Vrinta(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrinta(dt1, dt2, rd, rm);
   }
 
   void Vrinta(DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrinta(dt1, dt2, rd, rm);
   }
 
   void Vrintm(DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintm(dt1, dt2, rd, rm);
   }
 
   void Vrintm(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintm(dt1, dt2, rd, rm);
   }
 
   void Vrintm(DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintm(dt1, dt2, rd, rm);
   }
 
   void Vrintn(DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintn(dt1, dt2, rd, rm);
   }
 
   void Vrintn(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintn(dt1, dt2, rd, rm);
   }
 
   void Vrintn(DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintn(dt1, dt2, rd, rm);
   }
 
   void Vrintp(DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintp(dt1, dt2, rd, rm);
   }
 
   void Vrintp(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintp(dt1, dt2, rd, rm);
   }
 
   void Vrintp(DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintp(dt1, dt2, rd, rm);
   }
 
   void Vrintr(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrintr(cond, dt1, dt2, rd, rm);
   }
@@ -7827,9 +9496,11 @@ class MacroAssembler : public Assembler {
 
   void Vrintr(
       Condition cond, DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrintr(cond, dt1, dt2, rd, rm);
   }
@@ -7839,9 +9510,11 @@ class MacroAssembler : public Assembler {
 
   void Vrintx(
       Condition cond, DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrintx(cond, dt1, dt2, rd, rm);
   }
@@ -7850,17 +9523,21 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrintx(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintx(dt1, dt2, rd, rm);
   }
 
   void Vrintx(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrintx(cond, dt1, dt2, rd, rm);
   }
@@ -7870,9 +9547,11 @@ class MacroAssembler : public Assembler {
 
   void Vrintz(
       Condition cond, DataType dt1, DataType dt2, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrintz(cond, dt1, dt2, rd, rm);
   }
@@ -7881,17 +9560,21 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrintz(DataType dt1, DataType dt2, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vrintz(dt1, dt2, rd, rm);
   }
 
   void Vrintz(
       Condition cond, DataType dt1, DataType dt2, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrintz(cond, dt1, dt2, rd, rm);
   }
@@ -7901,9 +9584,12 @@ class MacroAssembler : public Assembler {
 
   void Vrshl(
       Condition cond, DataType dt, DRegister rd, DRegister rm, DRegister rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrshl(cond, dt, rd, rm, rn);
   }
@@ -7913,9 +9599,12 @@ class MacroAssembler : public Assembler {
 
   void Vrshl(
       Condition cond, DataType dt, QRegister rd, QRegister rm, QRegister rn) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrshl(cond, dt, rd, rm, rn);
   }
@@ -7928,9 +9617,12 @@ class MacroAssembler : public Assembler {
              DRegister rd,
              DRegister rm,
              const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrshr(cond, dt, rd, rm, operand);
   }
@@ -7943,9 +9635,12 @@ class MacroAssembler : public Assembler {
              QRegister rd,
              QRegister rm,
              const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrshr(cond, dt, rd, rm, operand);
   }
@@ -7958,9 +9653,12 @@ class MacroAssembler : public Assembler {
               DRegister rd,
               QRegister rm,
               const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrshrn(cond, dt, rd, rm, operand);
   }
@@ -7972,9 +9670,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrsqrte(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrsqrte(cond, dt, rd, rm);
   }
@@ -7983,9 +9683,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vrsqrte(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrsqrte(cond, dt, rd, rm);
   }
@@ -7995,9 +9697,12 @@ class MacroAssembler : public Assembler {
 
   void Vrsqrts(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrsqrts(cond, dt, rd, rn, rm);
   }
@@ -8007,9 +9712,12 @@ class MacroAssembler : public Assembler {
 
   void Vrsqrts(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrsqrts(cond, dt, rd, rn, rm);
   }
@@ -8022,9 +9730,12 @@ class MacroAssembler : public Assembler {
              DRegister rd,
              DRegister rm,
              const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrsra(cond, dt, rd, rm, operand);
   }
@@ -8037,9 +9748,12 @@ class MacroAssembler : public Assembler {
              QRegister rd,
              QRegister rm,
              const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrsra(cond, dt, rd, rm, operand);
   }
@@ -8049,9 +9763,12 @@ class MacroAssembler : public Assembler {
 
   void Vrsubhn(
       Condition cond, DataType dt, DRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vrsubhn(cond, dt, rd, rn, rm);
   }
@@ -8060,58 +9777,82 @@ class MacroAssembler : public Assembler {
   }
 
   void Vseleq(DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vseleq(dt, rd, rn, rm);
   }
 
   void Vseleq(DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vseleq(dt, rd, rn, rm);
   }
 
   void Vselge(DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vselge(dt, rd, rn, rm);
   }
 
   void Vselge(DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vselge(dt, rd, rn, rm);
   }
 
   void Vselgt(DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vselgt(dt, rd, rn, rm);
   }
 
   void Vselgt(DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vselgt(dt, rd, rn, rm);
   }
 
   void Vselvs(DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vselvs(dt, rd, rn, rm);
   }
 
   void Vselvs(DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     vselvs(dt, rd, rn, rm);
   }
 
@@ -8120,9 +9861,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vshl(cond, dt, rd, rm, operand);
   }
@@ -8135,9 +9879,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vshl(cond, dt, rd, rm, operand);
   }
@@ -8150,9 +9897,12 @@ class MacroAssembler : public Assembler {
              QRegister rd,
              DRegister rm,
              const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vshll(cond, dt, rd, rm, operand);
   }
@@ -8165,9 +9915,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vshr(cond, dt, rd, rm, operand);
   }
@@ -8180,9 +9933,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vshr(cond, dt, rd, rm, operand);
   }
@@ -8195,9 +9951,12 @@ class MacroAssembler : public Assembler {
              DRegister rd,
              QRegister rm,
              const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vshrn(cond, dt, rd, rm, operand);
   }
@@ -8210,9 +9969,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsli(cond, dt, rd, rm, operand);
   }
@@ -8225,9 +9987,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsli(cond, dt, rd, rm, operand);
   }
@@ -8236,18 +10001,22 @@ class MacroAssembler : public Assembler {
   }
 
   void Vsqrt(Condition cond, DataType dt, SRegister rd, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsqrt(cond, dt, rd, rm);
   }
   void Vsqrt(DataType dt, SRegister rd, SRegister rm) { Vsqrt(al, dt, rd, rm); }
 
   void Vsqrt(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsqrt(cond, dt, rd, rm);
   }
@@ -8258,9 +10027,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsra(cond, dt, rd, rm, operand);
   }
@@ -8273,9 +10045,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsra(cond, dt, rd, rm, operand);
   }
@@ -8288,9 +10063,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             DRegister rm,
             const DOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsri(cond, dt, rd, rm, operand);
   }
@@ -8303,9 +10081,12 @@ class MacroAssembler : public Assembler {
             QRegister rd,
             QRegister rm,
             const QOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsri(cond, dt, rd, rm, operand);
   }
@@ -8317,9 +10098,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const AlignedMemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vst1(cond, dt, nreglist, operand);
   }
@@ -8333,9 +10116,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const AlignedMemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vst2(cond, dt, nreglist, operand);
   }
@@ -8349,9 +10134,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const AlignedMemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vst3(cond, dt, nreglist, operand);
   }
@@ -8365,9 +10152,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vst3(cond, dt, nreglist, operand);
   }
@@ -8381,9 +10170,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             const NeonRegisterList& nreglist,
             const AlignedMemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vst4(cond, dt, nreglist, operand);
   }
@@ -8398,9 +10189,11 @@ class MacroAssembler : public Assembler {
             Register rn,
             WriteBack write_back,
             DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vstm(cond, dt, rn, write_back, dreglist);
   }
@@ -8425,9 +10218,11 @@ class MacroAssembler : public Assembler {
             Register rn,
             WriteBack write_back,
             SRegisterList sreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(sreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vstm(cond, dt, rn, write_back, sreglist);
   }
@@ -8452,9 +10247,11 @@ class MacroAssembler : public Assembler {
               Register rn,
               WriteBack write_back,
               DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vstmdb(cond, dt, rn, write_back, dreglist);
   }
@@ -8479,9 +10276,11 @@ class MacroAssembler : public Assembler {
               Register rn,
               WriteBack write_back,
               SRegisterList sreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(sreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vstmdb(cond, dt, rn, write_back, sreglist);
   }
@@ -8506,9 +10305,11 @@ class MacroAssembler : public Assembler {
               Register rn,
               WriteBack write_back,
               DRegisterList dreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(dreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vstmia(cond, dt, rn, write_back, dreglist);
   }
@@ -8533,9 +10334,11 @@ class MacroAssembler : public Assembler {
               Register rn,
               WriteBack write_back,
               SRegisterList sreglist) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(sreglist));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vstmia(cond, dt, rn, write_back, sreglist);
   }
@@ -8559,9 +10362,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             DRegister rd,
             const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vstr(cond, dt, rd, operand);
   }
@@ -8579,9 +10384,11 @@ class MacroAssembler : public Assembler {
             DataType dt,
             SRegister rd,
             const MemOperand& operand) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(operand));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vstr(cond, dt, rd, operand);
   }
@@ -8597,9 +10404,12 @@ class MacroAssembler : public Assembler {
 
   void Vsub(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsub(cond, dt, rd, rn, rm);
   }
@@ -8609,9 +10419,12 @@ class MacroAssembler : public Assembler {
 
   void Vsub(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsub(cond, dt, rd, rn, rm);
   }
@@ -8621,9 +10434,12 @@ class MacroAssembler : public Assembler {
 
   void Vsub(
       Condition cond, DataType dt, SRegister rd, SRegister rn, SRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsub(cond, dt, rd, rn, rm);
   }
@@ -8633,9 +10449,12 @@ class MacroAssembler : public Assembler {
 
   void Vsubhn(
       Condition cond, DataType dt, DRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsubhn(cond, dt, rd, rn, rm);
   }
@@ -8645,9 +10464,12 @@ class MacroAssembler : public Assembler {
 
   void Vsubl(
       Condition cond, DataType dt, QRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsubl(cond, dt, rd, rn, rm);
   }
@@ -8657,9 +10479,12 @@ class MacroAssembler : public Assembler {
 
   void Vsubw(
       Condition cond, DataType dt, QRegister rd, QRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vsubw(cond, dt, rd, rn, rm);
   }
@@ -8668,9 +10493,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vswp(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vswp(cond, dt, rd, rm);
   }
@@ -8683,9 +10510,11 @@ class MacroAssembler : public Assembler {
   }
 
   void Vswp(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vswp(cond, dt, rd, rm);
   }
@@ -8702,9 +10531,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             const NeonRegisterList& nreglist,
             DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vtbl(cond, dt, rd, nreglist, rm);
   }
@@ -8720,9 +10552,12 @@ class MacroAssembler : public Assembler {
             DRegister rd,
             const NeonRegisterList& nreglist,
             DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(nreglist));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vtbx(cond, dt, rd, nreglist, rm);
   }
@@ -8734,18 +10569,22 @@ class MacroAssembler : public Assembler {
   }
 
   void Vtrn(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vtrn(cond, dt, rd, rm);
   }
   void Vtrn(DataType dt, DRegister rd, DRegister rm) { Vtrn(al, dt, rd, rm); }
 
   void Vtrn(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vtrn(cond, dt, rd, rm);
   }
@@ -8753,9 +10592,12 @@ class MacroAssembler : public Assembler {
 
   void Vtst(
       Condition cond, DataType dt, DRegister rd, DRegister rn, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vtst(cond, dt, rd, rn, rm);
   }
@@ -8765,9 +10607,12 @@ class MacroAssembler : public Assembler {
 
   void Vtst(
       Condition cond, DataType dt, QRegister rd, QRegister rn, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rn));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vtst(cond, dt, rd, rn, rm);
   }
@@ -8776,36 +10621,44 @@ class MacroAssembler : public Assembler {
   }
 
   void Vuzp(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vuzp(cond, dt, rd, rm);
   }
   void Vuzp(DataType dt, DRegister rd, DRegister rm) { Vuzp(al, dt, rd, rm); }
 
   void Vuzp(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vuzp(cond, dt, rd, rm);
   }
   void Vuzp(DataType dt, QRegister rd, QRegister rm) { Vuzp(al, dt, rd, rm); }
 
   void Vzip(Condition cond, DataType dt, DRegister rd, DRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vzip(cond, dt, rd, rm);
   }
   void Vzip(DataType dt, DRegister rd, DRegister rm) { Vzip(al, dt, rd, rm); }
 
   void Vzip(Condition cond, DataType dt, QRegister rd, QRegister rm) {
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rd));
+    VIXL_ASSERT(!AliasesAvailableScratchRegister(rm));
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     vzip(cond, dt, rd, rm);
   }
@@ -8814,7 +10667,7 @@ class MacroAssembler : public Assembler {
   void Yield(Condition cond) {
     VIXL_ASSERT(allow_macro_instructions_);
     VIXL_ASSERT(OutsideITBlock());
-    AllowAssemblerEmissionScope allow_scope(this, kMaxInstructionSizeInBytes);
+    MacroEmissionCheckScope guard(this);
     ITScope it_scope(this, &cond);
     yield(cond);
   }
@@ -9093,107 +10946,18 @@ class MacroAssembler : public Assembler {
   }
   void Vsub(VRegister rd, VRegister rn, VRegister rm) { Vsub(al, rd, rn, rm); }
   // End of generated code.
+
  private:
   RegisterList available_;
   VRegisterList available_vfp_;
+  UseScratchRegisterScope* current_scratch_scope_;
   MacroAssemblerContext context_;
   Label::Offset checkpoint_;
   LiteralPoolManager literal_pool_manager_;
   VeneerPoolManager veneer_pool_manager_;
   bool generate_simulator_code_;
   bool allow_macro_instructions_;
-};
-
-// This scope is used to ensure that the specified size of instructions will be
-// emitted contiguously. The assert policy kExtactSize should only be used
-// when you use directly the assembler as it's difficult to know exactly how
-// many instructions will be emitted by the macro-assembler. Using the assembler
-// means that you directly use the assembler instructions (in lower case) from a
-// MacroAssembler object.
-class CodeBufferCheckScope {
- public:
-  // Tell whether or not the scope should assert the amount of code emitted
-  // within the scope is consistent with the requested amount.
-  enum AssertPolicy {
-    kNoAssert,    // No assert required.
-    kExactSize,   // The code emitted must be exactly size bytes.
-    kMaximumSize  // The code emitted must be at most size bytes.
-  };
-
-  CodeBufferCheckScope(MacroAssembler* masm,
-                       uint32_t size,
-                       AssertPolicy assert_policy = kMaximumSize)
-      : masm_(masm) {
-    masm->EnsureEmitFor(size);
-#ifdef VIXL_DEBUG
-    initial_cursor_offset_ = masm->GetCursorOffset();
-    size_ = size;
-    assert_policy_ = assert_policy;
-#else
-    USE(assert_policy);
-#endif
-  }
-
-  ~CodeBufferCheckScope() {
-#ifdef VIXL_DEBUG
-    switch (assert_policy_) {
-      case kNoAssert:
-        break;
-      case kExactSize:
-        VIXL_ASSERT(masm_->GetCursorOffset() - initial_cursor_offset_ == size_);
-        break;
-      case kMaximumSize:
-        VIXL_ASSERT(masm_->GetCursorOffset() - initial_cursor_offset_ <= size_);
-        break;
-      default:
-        VIXL_UNREACHABLE();
-    }
-#endif
-  }
-
- protected:
-  MacroAssembler* masm_;
-  uint32_t initial_cursor_offset_;
-  uint32_t size_;
-  AssertPolicy assert_policy_;
-};
-
-// Use this scope when you need a one-to-one mapping between methods and
-// instructions. This scope prevents the MacroAssembler functions from being
-// called and the literal pools and veneers from being emitted (they can only be
-// emitted when you create the scope). It also asserts the size of the emitted
-// instructions is the specified size (or not greater than the specified size).
-// This scope must be used when you want to directly use the assembler. It will
-// ensure that the buffer is big enough and that you don't break the pool and
-// veneer mechanisms.
-class AssemblerAccurateScope : public CodeBufferCheckScope {
- public:
-  AssemblerAccurateScope(MacroAssembler* masm,
-                         uint32_t size,
-                         AssertPolicy policy = kExactSize)
-      : CodeBufferCheckScope(masm, size, policy) {
-    VIXL_ASSERT(policy != kNoAssert);
-#ifdef VIXL_DEBUG
-    old_allow_macro_instructions_ = masm->AllowMacroInstructions();
-    old_allow_assembler_ = masm->AllowAssembler();
-    masm->SetAllowMacroInstructions(false);
-    masm->SetAllowAssembler(true);
-#else
-    USE(old_allow_macro_instructions_);
-    USE(old_allow_assembler_);
-#endif
-  }
-
-  ~AssemblerAccurateScope() {
-#ifdef VIXL_DEBUG
-    masm_->SetAllowMacroInstructions(old_allow_macro_instructions_);
-    masm_->SetAllowAssembler(old_allow_assembler_);
-#endif
-  }
-
- private:
-  bool old_allow_macro_instructions_;
-  bool old_allow_assembler_;
+  bool doing_veneer_pool_generation_;
 };
 
 // This scope utility allows scratch registers to be managed safely. The
@@ -9203,25 +10967,24 @@ class AssemblerAccurateScope : public CodeBufferCheckScope {
 //
 // When the scope ends, the MacroAssembler's lists will be restored to their
 // original state, even if the lists were modified by some other means.
+//
+// Scopes must nest perfectly. That is, they must be destructed in reverse
+// construction order. Otherwise, it is not clear how to handle cases where one
+// scope acquires a register that was included in a now-closing scope. With
+// perfect nesting, this cannot occur.
 class UseScratchRegisterScope {
  public:
   // This constructor implicitly calls the `Open` function to initialise the
   // scope, so it is ready to use immediately after it has been constructed.
   explicit UseScratchRegisterScope(MacroAssembler* masm)
-      : available_(NULL),
-        available_vfp_(NULL),
-        old_available_(0),
-        old_available_vfp_(0) {
+      : masm_(NULL), parent_(NULL), old_available_(0), old_available_vfp_(0) {
     Open(masm);
   }
   // This constructor allows deferred and optional initialisation of the scope.
   // The user is required to explicitly call the `Open` function before using
   // the scope.
   UseScratchRegisterScope()
-      : available_(NULL),
-        available_vfp_(NULL),
-        old_available_(0),
-        old_available_vfp_(0) {}
+      : masm_(NULL), parent_(NULL), old_available_(0), old_available_vfp_(0) {}
 
   // This function performs the actual initialisation work.
   void Open(MacroAssembler* masm);
@@ -9284,13 +11047,18 @@ class UseScratchRegisterScope {
     Exclude(VRegisterList(reg1, reg2, reg3, reg4));
   }
 
+  // A convenience helper to exclude any registers used by the operand.
+  void Exclude(const Operand& operand);
+
   // Prevent any scratch registers from being used in this scope.
   void ExcludeAll();
 
  private:
-  // Available scratch registers.
-  RegisterList* available_;       // kRRegister
-  VRegisterList* available_vfp_;  // kVRegister
+  // The MacroAssembler maintains a list of available scratch registers, and
+  // also keeps track of the most recently-opened scope so that on destruction
+  // we can check that scopes do not outlive their parents.
+  MacroAssembler* masm_;
+  UseScratchRegisterScope* parent_;
 
   // The state of the available lists at the start of this scope.
   uint32_t old_available_;      // kRRegister
@@ -9380,11 +11148,13 @@ class JumpTable : public JumpTableBase {
   explicit JumpTable(int length) : JumpTableBase(length, sizeof(T)) {}
 
  public:
-  virtual void Link(MacroAssembler* masm, int case_index, uint32_t location) {
+  virtual void Link(MacroAssembler* masm,
+                    int case_index,
+                    uint32_t location) VIXL_OVERRIDE {
     uint32_t position_in_table = GetLocationForCase(case_index);
     uint32_t from = GetBranchLocation();
     int offset = location - from;
-    T* case_offset = masm->GetBuffer().GetOffsetAddress<T*>(position_in_table);
+    T* case_offset = masm->GetBuffer()->GetOffsetAddress<T*>(position_in_table);
     if (masm->IsUsingT32()) {
       *case_offset = offset >> 1;
     } else {

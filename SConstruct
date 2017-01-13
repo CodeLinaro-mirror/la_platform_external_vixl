@@ -37,6 +37,8 @@ sys.path.insert(0, join(root_dir, 'tools'))
 import config
 import util
 
+from SCons.Errors import UserError
+
 
 Help('''
 Build system for the VIXL project.
@@ -45,7 +47,7 @@ See README.md for documentation and details about the build system.
 
 
 # We track top-level targets to automatically generate help and alias them.
-class TopLevelTargets:
+class VIXLTargets:
   def __init__(self):
     self.targets = []
     self.help_messages = []
@@ -62,7 +64,7 @@ class TopLevelTargets:
         len(' : ') + max(map(len, self.help_messages)))
     return res
 
-top_level_targets = TopLevelTargets()
+top_level_targets = VIXLTargets()
 
 
 
@@ -93,6 +95,16 @@ options = {
     'mode:release' : {
       'CCFLAGS' : ['-O3'],
       },
+    'target_arch:aarch32' : {
+      'CCFLAGS' : ['-DVIXL_INCLUDE_TARGET_AARCH32']
+      },
+    'target_arch:aarch64' : {
+      'CCFLAGS' : ['-DVIXL_INCLUDE_TARGET_AARCH64']
+      },
+    'target_arch:both' : {
+      'CCFLAGS' : ['-DVIXL_INCLUDE_TARGET_AARCH32',
+                   '-DVIXL_INCLUDE_TARGET_AARCH64']
+      },
     'simulator:aarch64' : {
       'CCFLAGS' : ['-DVIXL_INCLUDE_SIMULATOR_AARCH64'],
       },
@@ -100,6 +112,15 @@ options = {
       'CCFLAGS' : ['-g'],
       'LINKFLAGS' : ['-g']
       },
+    'negative_testing:on' : {
+      'CCFLAGS' : ['-DVIXL_NEGATIVE_TESTING']
+      },
+    'code_buffer_allocator:mmap' : {
+      'CCFLAGS' : ['-DVIXL_CODE_BUFFER_MMAP']
+      },
+    'code_buffer_allocator:malloc' : {
+      'CCFLAGS' : ['-DVIXL_CODE_BUFFER_MALLOC']
+      }
     }
 
 
@@ -115,16 +136,28 @@ def modifiable_flags_handler(env):
 def symbols_handler(env):
   env['symbols'] = 'on' if 'mode' in env and env['mode'] == 'debug' else 'off'
 
+def Is32BitHost(env):
+  return env['host_arch'] in ['aarch32', 'i386']
+
+def IsAArch64Host(env):
+  return env['host_arch'] == 'aarch64'
+
+def CanTargetAArch32(env):
+  return env['target_arch'] in ['aarch32', 'both']
+
+def CanTargetAArch64(env):
+  return env['target_arch'] in ['aarch64', 'both']
+
 
 # The architecture targeted by default will depend on the compiler being
 # used. 'host_arch' is extracted from the compiler while 'target_arch' can be
 # set by the user.
-# By default, we target both AArch32 and AArch64 unless the compiler
-# targets AArch32. At the moment, we cannot build VIXL's AArch64 support on a 32
-# bit platform.
-# TODO: Port VIXL to build on a 32 bit platform.
+# By default, we target both AArch32 and AArch64 unless the compiler targets a
+# 32-bit architecture. At the moment, we cannot build VIXL's AArch64 support on
+# a 32-bit platform.
+# TODO: Port VIXL to build on a 32-bit platform.
 def target_arch_handler(env):
-  if env['host_arch'] == 'aarch32':
+  if Is32BitHost(env):
     env['target_arch'] = 'aarch32'
   else:
     env['target_arch'] = 'both'
@@ -133,25 +166,53 @@ def target_arch_handler(env):
 # By default, include the simulator only if AArch64 is targeted and we are not
 # building VIXL natively for AArch64.
 def simulator_handler(env):
-  if env['host_arch'] != 'aarch64' and \
-     env['target_arch'] in ['aarch64', 'both']:
+  if not IsAArch64Host(env) and CanTargetAArch64(env):
     env['simulator'] = 'aarch64'
   else:
     env['simulator'] = 'none'
 
 
+# 'mmap' is required for use with 'mprotect', which is needed for the tests
+# (when running natively), so we use it by default where we can.
+def code_buffer_allocator_handler(env):
+  directives = util.GetCompilerDirectives(env)
+  if '__linux__' in directives:
+    env['code_buffer_allocator'] = 'mmap'
+  else:
+    env['code_buffer_allocator'] = 'malloc'
+
+# A validator checks the consistency of provided options against the environment.
+def default_validator(env):
+  pass
+
+
+def target_arch_validator(env):
+  # TODO: Port VIXL64 to work on a 32-bit platform.
+  if Is32BitHost(env) and CanTargetAArch64(env):
+    raise UserError('Building VIXL for AArch64 in 32-bit is not supported. Set '
+                    '`target_arch` to `aarch32`')
+
+
+def simulator_validator(env):
+  if env['simulator'] == 'aarch64' and not CanTargetAArch64(env):
+    raise UserError('Building an AArch64 simulator implies that VIXL targets '
+                    'AArch64. Set `target_arch` to `aarch64` or `both`.')
+
+
 # Default variables may depend on each other, therefore we need this dictionnary
 # to be ordered.
 vars_default_handlers = OrderedDict({
-    # variable_name    : [ 'default val', 'handler'                ]
-    'symbols'          : [ 'mode==debug', symbols_handler          ],
-    'modifiable_flags' : [ 'mode==debug', modifiable_flags_handler ],
-    'target_arch'      : [ 'same as host architecture if running on AArch32 - '
-                           'otherwise both',
-                           target_arch_handler ],
-    'simulator'        : ['on if the target architectures include AArch64 but '
+    # variable_name    : [ 'default val', 'handler', 'validator']
+    'symbols'          : [ 'mode==debug', symbols_handler, default_validator ],
+    'modifiable_flags' : [ 'mode==debug', modifiable_flags_handler, default_validator],
+    'target_arch'      : [ 'AArch32 only if the host compiler targets a 32-bit '
+                           'architecture - otherwise both', target_arch_handler,
+                           target_arch_validator],
+    'simulator'        : [ 'on if the target architectures include AArch64 but '
                            'the host is not AArch64, else off',
-                           simulator_handler ]
+                           simulator_handler, simulator_validator ],
+    'code_buffer_allocator' : [ 'mmap with __linux__, malloc otherwise',
+                                code_buffer_allocator_handler, default_validator ]
     })
 
 
@@ -160,11 +221,9 @@ def DefaultVariable(name, help, allowed_values):
   default_value = vars_default_handlers[name][0]
   def validator(name, value, env):
     if value != default_value and value not in allowed_values:
-        raise SCons.Errors.UserError(
-            'Invalid value for option {name}: {value}.  '
-            'Valid values are: {allowed_values}'.format(name,
-                                                        value,
-                                                        allowed_values))
+        raise UserError('Invalid value for option {name}: {value}.  '
+                        'Valid values are: {allowed_values}'.format(
+                            name, value, allowed_values))
   return (name, help, default_value, validator)
 
 
@@ -173,27 +232,28 @@ vars = Variables()
 vars.AddVariables(
     EnumVariable('mode', 'Build mode',
                  'release', allowed_values=config.build_options_modes),
+    EnumVariable('negative_testing',
+                  'Enable negative testing (needs exceptions)',
+                 'off', allowed_values=['on', 'off']),
     DefaultVariable('symbols', 'Include debugging symbols in the binaries',
                     ['on', 'off']),
     DefaultVariable('target_arch', 'Target architecture',
                     ['aarch32', 'aarch64', 'both']),
     DefaultVariable('simulator', 'Simulators to include', ['aarch64', 'none']),
+    DefaultVariable('code_buffer_allocator',
+                    'Configure the allocation mechanism in the CodeBuffer',
+                    ['malloc', 'mmap']),
     ('std', 'C++ standard. The standards tested are: %s.' % \
                                          ', '.join(config.tested_cpp_standards))
     )
-
-# Abort the build if any command line option is unknown or invalid.
-unknown_build_options = vars.UnknownVariables()
-if unknown_build_options:
-  print 'Unknown build options:',  unknown_build_options.keys()
-  Exit(1)
 
 # We use 'variant directories' to avoid recompiling multiple times when build
 # options are changed, different build paths are used depending on the options
 # set. These are the options that should be reflected in the build directory
 # path.
 options_influencing_build_path = [
-  'target_arch', 'mode', 'symbols', 'CXX', 'std', 'simulator'
+  'target_arch', 'mode', 'symbols', 'CXX', 'std', 'simulator',
+  'negative_testing', 'code_buffer_allocator'
 ]
 
 
@@ -233,6 +293,11 @@ def ProcessBuildOptions(env):
     if env_dict.get(key) == default:
       handler(env_dict)
 
+  # Second, run the series of validators, to check for errors.
+  for _, value in vars_default_handlers.items():
+    validator = value[2]
+    validator(env)
+
   for key in env_dict.keys():
     # Then update the environment according to the value of the variable.
     key_val_couple = key + ':%s' % env_dict[key]
@@ -242,9 +307,8 @@ def ProcessBuildOptions(env):
 
 
 def ConfigureEnvironmentForCompiler(env):
-  def is_compiler(compiler):
-    return env['CXX'].find(compiler) == 0
-  if is_compiler('clang++'):
+  compiler = util.CompilerInformation(env)
+  if compiler == 'clang':
     # These warnings only work for Clang.
     # -Wimplicit-fallthrough only works when compiling the code base as C++11 or
     # newer. The compiler does not complain if the option is passed when
@@ -252,36 +316,31 @@ def ConfigureEnvironmentForCompiler(env):
     env.Append(CPPFLAGS = ['-Wimplicit-fallthrough', '-Wshorten-64-to-32'])
 
     # The '-Wunreachable-code' flag breaks builds for clang 3.4.
-    process = subprocess.Popen(env['CXX'] + ' --version | grep "clang.*3\.4"',
-                               shell = True,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    stdout, stderr = process.communicate()
-    using_clang3_4 = stdout != ''
-    if not using_clang3_4:
+    if compiler != 'clang-3.4':
       env.Append(CPPFLAGS = ['-Wunreachable-code'])
-
-    env.Append(CPPFLAGS = ['-Wno-shorten-64-to-32'])
 
   # GCC 4.8 has a bug which produces a warning saying that an anonymous Operand
   # object might be used uninitialized:
   #   http://gcc.gnu.org/bugzilla/show_bug.cgi?id=57045
   # The bug does not seem to appear in GCC 4.7, or in debug builds with GCC 4.8.
   if env['mode'] == 'release':
-    process = subprocess.Popen(env['CXX'] + ' --version 2>&1 | grep "g++.*4\.8"',
-                               shell = True,
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    stdout, unused = process.communicate()
-    using_gcc48 = stdout != ''
-    if using_gcc48:
+    if compiler == 'gcc-4.8':
       env.Append(CPPFLAGS = ['-Wno-maybe-uninitialized'])
+
   # When compiling with c++98 (the default), allow long long constants.
   if 'std' not in env or env['std'] == 'c++98':
     env.Append(CPPFLAGS = ['-Wno-long-long'])
+  # When compiling with c++11, suggest missing override keywords on methods.
+  if 'std' in env and env['std'] in ['c++11', 'c++14']:
+    if compiler >= 'gcc-5':
+      env.Append(CPPFLAGS = ['-Wsuggest-override'])
+    elif compiler >= 'clang-3.6':
+      env.Append(CPPFLAGS = ['-Winconsistent-missing-override'])
 
 
 def ConfigureEnvironment(env):
   RetrieveEnvironmentVariables(env)
-  env['host_arch'] = util.GetHostArch(env['CXX'])
+  env['host_arch'] = util.GetHostArch(env)
   ProcessBuildOptions(env)
   if 'std' in env:
     env.Append(CPPFLAGS = ['-std=' + env['std']])
@@ -328,7 +387,17 @@ def VIXLLibraryTarget(env):
 # Build ------------------------------------------------------------------------
 
 # The VIXL library, built by default.
-env = Environment(variables = vars)
+env = Environment(variables = vars,
+                  BUILDERS = {
+                      'Markdown': Builder(action = 'markdown $SOURCE > $TARGET',
+                                          suffix = '.html')
+                  })
+# Abort the build if any command line option is unknown or invalid.
+unknown_build_options = vars.UnknownVariables()
+if unknown_build_options:
+  print 'Unknown build options:',  unknown_build_options.keys()
+  Exit(1)
+
 ConfigureEnvironment(env)
 Help(vars.GenerateHelpText(env))
 libvixl = VIXLLibraryTarget(env)
@@ -426,3 +495,24 @@ env.Alias('all', top_level_targets.targets)
 top_level_targets.Add('all', 'Build all the targets above.')
 
 Help('\n\nAvailable top level targets:\n' + top_level_targets.Help())
+
+extra_targets = VIXLTargets()
+
+# Build documentation
+doc = [
+    env.Markdown('README.md'),
+    env.Markdown('doc/changelog.md'),
+    env.Markdown('doc/aarch32/getting-started-aarch32.md'),
+    env.Markdown('doc/aarch32/design/code-generation-aarch32.md'),
+    env.Markdown('doc/aarch32/design/literal-pool-aarch32.md'),
+    env.Markdown('doc/aarch64/supported-instructions-aarch64.md'),
+    env.Markdown('doc/aarch64/getting-started-aarch64.md'),
+    env.Markdown('doc/aarch64/topics/ycm.md'),
+    env.Markdown('doc/aarch64/topics/extending-the-disassembler.md'),
+    env.Markdown('doc/aarch64/topics/index.md'),
+]
+env.Alias('doc', doc)
+extra_targets.Add('doc', 'Convert documentation to HTML (requires the '
+                         '`markdown` program).')
+
+Help('\nAvailable extra targets:\n' + extra_targets.Help())

@@ -120,8 +120,11 @@ class TestCase(object):
     input_filter    Python expression as a string to filter out inputs.
     operand_limit   Optional limit of the number of operands to generate.
     input_limit     Optional limit of the number of inputs to generate.
-    expect_instruction_before Optional instruction that the macro-assembler
-                              should have generated.
+    it_condition    If not None, an IT instruction needs to be generated for the
+                    instruction under test to be valid. This member is a string
+                    template indicating the name of the condition operand, to be
+                    used with "format". For example, it will most likely have
+                    the value "{cond}".
   """
 
   # Declare functions that will be callable from Python expressions in
@@ -132,8 +135,7 @@ class TestCase(object):
   }
 
   def __init__(self, name, seed, operand_names, input_names, operand_filter,
-               input_filter, operand_limit, input_limit,
-               expect_instruction_before):
+               input_filter, operand_limit, input_limit, it_condition):
     self.name = name
     self.seed = seed
     self.operand_names = operand_names
@@ -142,7 +144,7 @@ class TestCase(object):
     self.input_filter = input_filter
     self.operand_limit = operand_limit
     self.input_limit = input_limit
-    self.expect_instruction_before = expect_instruction_before
+    self.it_condition = it_condition
 
   def GenerateOperands(self, operand_types):
     """
@@ -206,8 +208,11 @@ class TestCase(object):
         # Build a list of operands by only keeping the second element of each
         # tuple.
         [operand[1] for operand in operands],
-        # Pass the operands as dictionnary to build the instruction string.
-        self.expect_instruction_before.format(**dict(operands))
+        # The next field is a boolean indicating if the test case needs to
+        # generate an IT instruction.
+        "true" if self.it_condition else "false",
+        # If so, what condition should it be?
+        self.it_condition.format(**dict(operands)) if self.it_condition else "al"
       )
 
     # Build and return a list of operand definitions by computing the product of
@@ -321,6 +326,15 @@ class Generator(object):
     else:
       self.operands = operands
 
+  def MnemonicToMethodName(self, mnemonic):
+    if self.test_type in ["simulator", "macro-assembler"]:
+      # Return a MacroAssembler method name
+      return mnemonic.capitalize()
+    else:
+      # Return an Assembler method name
+      method_name = mnemonic.lower()
+      return "and_" if method_name == "and" else method_name
+
   def InstructionListDeclaration(self):
     """
     ~~~
@@ -332,9 +346,10 @@ class Generator(object):
     ...
     ~~~
     """
-    return "".join(
-        ["M({}) \\\n".format(mnemonic) for mnemonic in self.mnemonics])
-
+    return "".join([
+      "M({}) \\\n".format(self.MnemonicToMethodName(mnemonic))
+      for mnemonic in self.mnemonics
+    ])
 
   def OperandDeclarations(self):
     """
@@ -423,22 +438,36 @@ class Generator(object):
                          operands_description=" ".join(operand),
                          identifier=test_case.name + "_" + "_".join(operand),
                          test_case_name=test_case.name)
-          for operand, _ in test_case.GenerateOperands(self.operands)
+          for operand, _, _ in test_case.GenerateOperands(self.operands)
       ]
       return ",\n".join(test_cases)
 
     def AssemblerTestCaseDefinition(test_case):
       test_cases = [
           """{{ {{ {operands} }},
-             "{expect_instruction_before}",
+             {in_it_block},
+             {it_condition},
              "{operands_description}",
              "{identifier}" }}
               """.format(operands=",".join(operand),
-                         expect_instruction_before=expect_instruction_before,
+                         in_it_block=in_it_block,
+                         it_condition=it_condition,
                          operands_description=" ".join(operand),
                          identifier="_".join(operand))
-          for operand, expect_instruction_before
+          for operand, in_it_block, it_condition
               in test_case.GenerateOperands(self.operands)
+      ]
+      return ",\n".join(test_cases)
+
+    def MacroAssemblerTestCaseDefinition(test_case):
+      test_cases = [
+          """{{ {{ {operands} }},
+             "{operands_description}",
+             "{identifier}" }}
+              """.format(operands=",".join(operand),
+                         operands_description=", ".join(operand),
+                         identifier="_".join(operand))
+          for operand, _, _ in test_case.GenerateOperands(self.operands)
       ]
       return ",\n".join(test_cases)
 
@@ -446,6 +475,8 @@ class Generator(object):
       return ",\n".join(map(SimulatorTestCaseDefinition, self.test_cases))
     elif self.test_type == "assembler":
       return ",\n".join(map(AssemblerTestCaseDefinition, self.test_cases))
+    elif self.test_type == "macro-assembler":
+      return ",\n".join(map(MacroAssemblerTestCaseDefinition, self.test_cases))
     else:
       raise Exception("Unrecognized test type \"{}\".".format(self.test_type))
 
@@ -492,11 +523,14 @@ class Generator(object):
     ~~~
     """
     code = "".join([operand.Instantiate() for operand in self.operands])
-    if self.test_type == "simulator":
+    if self.test_type in ["simulator", "macro-assembler"]:
       # Simulator tests need scratch registers to function and uses
       # `UseScratchRegisterScope` to dynamically allocate them. We need to
       # exclude all register operands from the list of available scratch
       # registers.
+      # MacroAssembler test also need to ensure that they don't try to run tests
+      # with registers that are scratch registers; the MacroAssembler contains
+      # assertions to protect against such usage.
       excluded_registers = [
           "scratch_registers.Exclude({});".format(operand.name)
           for operand in self.operands.unwrap()
@@ -633,7 +667,7 @@ class Generator(object):
     SIMULATOR_COND_RD_RN_RM_...
     ~~~
     """
-    return self.test_type.upper() + "_" + \
+    return self.test_type.replace("-", "_").upper() + "_" + \
         self.test_name.replace("-", "_").upper()
 
   def GetTraceFileName(self, mnemonic):
@@ -648,7 +682,10 @@ class Generator(object):
     Write out empty trace files so we can compile the new test cases.
     """
     for mnemonic in self.mnemonics:
+      # The MacroAssembler tests have no traces.
+      if self.test_type == "macro-assembler": continue
+
       with open(os.path.join(output_directory, self.GetTraceFileName(mnemonic)),
                 "w") as f:
         code = "static const TestResult *kReference{} = NULL;\n"
-        f.write(code.format(mnemonic))
+        f.write(code.format(self.MnemonicToMethodName(mnemonic)))

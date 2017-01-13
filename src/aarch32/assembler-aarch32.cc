@@ -32,12 +32,12 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>  // NOLINT
+#include <iostream>
 
 #include "utils-vixl.h"
 #include "aarch32/constants-aarch32.h"
 #include "aarch32/instructions-aarch32.h"
-#include "aarch32/operand-aarch32.h"
+#include "aarch32/operands-aarch32.h"
 #include "aarch32/assembler-aarch32.h"
 
 namespace vixl {
@@ -79,9 +79,25 @@ void Assembler::PerformCheckIT(Condition condition) {
 #endif
 
 
+void Assembler::BindHelper(Label* label) {
+  VIXL_ASSERT(!label->IsBound());
+  label->Bind(GetCursorOffset(), IsUsingT32());
+
+  for (Label::ForwardRefList::iterator ref = label->GetFirstForwardRef();
+       ref != label->GetEndForwardRef();
+       ref++) {
+    EncodeLabelFor(*ref, label);
+  }
+  if (label->IsInVeneerPool()) {
+    label->GetVeneerPoolManager()->RemoveLabel(label);
+  }
+}
+
+
 uint32_t Assembler::Link(uint32_t instr,
                          Label* label,
                          const Label::LabelEmitOperator& op) {
+  label->SetReferenced();
   if (label->IsBound()) {
     return op.Encode(instr,
                      GetCursorOffset() + GetArchitectureStatePCOffset(),
@@ -117,18 +133,6 @@ void Assembler::EncodeLabelFor(const Label::ForwardReference& forward,
   } else {
     uint32_t* instr_ptr = buffer_.GetOffsetAddress<uint32_t*>(location);
     instr_ptr[0] = encoder.Encode(instr_ptr[0], from, label);
-  }
-}
-
-
-void Assembler::bind(Label* label) {
-  VIXL_ASSERT(!label->IsBound());
-  label->Bind(GetCursorOffset(), IsUsingT32());
-
-  for (Label::ForwardRefList::iterator ref = label->GetFirstForwardRef();
-       ref != label->GetEndForwardRef();
-       ref++) {
-    EncodeLabelFor(*ref, label);
   }
 }
 
@@ -1803,7 +1807,8 @@ void Assembler::adc(Condition cond,
     if (IsUsingT32()) {
       ImmediateT32 immediate_t32(imm);
       // ADC{<c>}{<q>} {<Rd>}, <Rn>, #<const> ; T1
-      if (!size.IsNarrow() && immediate_t32.IsValid()) {
+      if (!size.IsNarrow() && immediate_t32.IsValid() &&
+          ((!rd.IsPC() && !rn.IsPC()) || AllowUnpredictable())) {
         EmitT32_32(0xf1400000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    (immediate_t32.GetEncodingValue() & 0xff) |
                    ((immediate_t32.GetEncodingValue() & 0x700) << 4) |
@@ -1839,7 +1844,8 @@ void Assembler::adc(Condition cond,
     uint32_t amount = operand.GetShiftAmount();
     if (IsUsingT32()) {
       // ADC{<c>}{<q>} {<Rd>}, <Rn>, <Rm> {, <shift> #<amount> } ; T2
-      if (!size.IsNarrow() && shift.IsValidAmount(amount)) {
+      if (!size.IsNarrow() && shift.IsValidAmount(amount) &&
+          ((!rd.IsPC() && !rn.IsPC() && !rm.IsPC()) || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_32(0xeb400000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    rm.GetCode() | (operand.GetTypeEncodingValue() << 4) |
@@ -1863,7 +1869,9 @@ void Assembler::adc(Condition cond,
     Shift shift = operand.GetShift();
     if (IsUsingA32()) {
       // ADC{<c>}{<q>} {<Rd>}, <Rn>, <Rm>, <shift> <Rs> ; A1
-      if (cond.IsNotNever()) {
+      if (cond.IsNotNever() && ((!rd.IsPC() && !rn.IsPC() && !rm.IsPC() &&
+                                 !operand.GetShiftRegister().IsPC()) ||
+                                AllowUnpredictable())) {
         EmitA32(0x00a00010U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
                 (shift.GetType() << 5) |
@@ -1887,7 +1895,8 @@ void Assembler::adcs(Condition cond,
     if (IsUsingT32()) {
       ImmediateT32 immediate_t32(imm);
       // ADCS{<c>}{<q>} {<Rd>}, <Rn>, #<const> ; T1
-      if (!size.IsNarrow() && immediate_t32.IsValid()) {
+      if (!size.IsNarrow() && immediate_t32.IsValid() &&
+          ((!rd.IsPC() && !rn.IsPC()) || AllowUnpredictable())) {
         EmitT32_32(0xf1500000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    (immediate_t32.GetEncodingValue() & 0xff) |
                    ((immediate_t32.GetEncodingValue() & 0x700) << 4) |
@@ -1923,7 +1932,8 @@ void Assembler::adcs(Condition cond,
     uint32_t amount = operand.GetShiftAmount();
     if (IsUsingT32()) {
       // ADCS{<c>}{<q>} {<Rd>}, <Rn>, <Rm> {, <shift> #<amount> } ; T2
-      if (!size.IsNarrow() && shift.IsValidAmount(amount)) {
+      if (!size.IsNarrow() && shift.IsValidAmount(amount) &&
+          ((!rd.IsPC() && !rn.IsPC() && !rm.IsPC()) || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_32(0xeb500000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    rm.GetCode() | (operand.GetTypeEncodingValue() << 4) |
@@ -1947,7 +1957,9 @@ void Assembler::adcs(Condition cond,
     Shift shift = operand.GetShift();
     if (IsUsingA32()) {
       // ADCS{<c>}{<q>} {<Rd>}, <Rn>, <Rm>, <shift> <Rs> ; A1
-      if (cond.IsNotNever()) {
+      if (cond.IsNotNever() && ((!rd.IsPC() && !rn.IsPC() && !rm.IsPC() &&
+                                 !operand.GetShiftRegister().IsPC()) ||
+                                AllowUnpredictable())) {
         EmitA32(0x00b00010U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
                 (shift.GetType() << 5) |
@@ -2009,14 +2021,16 @@ void Assembler::add(Condition cond,
         return;
       }
       // ADD{<c>}{<q>} <Rd>, PC, #<imm12> ; T3
-      if (!size.IsNarrow() && rn.Is(pc) && (imm <= 4095)) {
+      if (!size.IsNarrow() && rn.Is(pc) && (imm <= 4095) &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf20f0000U | (rd.GetCode() << 8) | (imm & 0xff) |
                    ((imm & 0x700) << 4) | ((imm & 0x800) << 15));
         AdvanceIT();
         return;
       }
       // ADD{<c>}{<q>} {<Rd>}, <Rn>, #<const> ; T3
-      if (!size.IsNarrow() && immediate_t32.IsValid() && !rn.Is(sp)) {
+      if (!size.IsNarrow() && immediate_t32.IsValid() && !rn.Is(sp) &&
+          ((!rd.IsPC() && !rn.IsPC()) || AllowUnpredictable())) {
         EmitT32_32(0xf1000000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    (immediate_t32.GetEncodingValue() & 0xff) |
                    ((immediate_t32.GetEncodingValue() & 0x700) << 4) |
@@ -2025,14 +2039,16 @@ void Assembler::add(Condition cond,
         return;
       }
       // ADD{<c>}{<q>} {<Rd>}, <Rn>, #<imm12> ; T4
-      if (!size.IsNarrow() && (imm <= 4095) && ((rn.GetCode() & 0xd) != 0xd)) {
+      if (!size.IsNarrow() && (imm <= 4095) && ((rn.GetCode() & 0xd) != 0xd) &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf2000000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    (imm & 0xff) | ((imm & 0x700) << 4) | ((imm & 0x800) << 15));
         AdvanceIT();
         return;
       }
       // ADD{<c>}{<q>} {<Rd>}, SP, #<const> ; T3
-      if (!size.IsNarrow() && rn.Is(sp) && immediate_t32.IsValid()) {
+      if (!size.IsNarrow() && rn.Is(sp) && immediate_t32.IsValid() &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf10d0000U | (rd.GetCode() << 8) |
                    (immediate_t32.GetEncodingValue() & 0xff) |
                    ((immediate_t32.GetEncodingValue() & 0x700) << 4) |
@@ -2041,7 +2057,8 @@ void Assembler::add(Condition cond,
         return;
       }
       // ADD{<c>}{<q>} {<Rd>}, SP, #<imm12> ; T4
-      if (!size.IsNarrow() && rn.Is(sp) && (imm <= 4095)) {
+      if (!size.IsNarrow() && rn.Is(sp) && (imm <= 4095) &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf20d0000U | (rd.GetCode() << 8) | (imm & 0xff) |
                    ((imm & 0x700) << 4) | ((imm & 0x800) << 15));
         AdvanceIT();
@@ -2084,14 +2101,19 @@ void Assembler::add(Condition cond,
           return;
         }
         // ADD{<c>}{<q>} {<Rdn>}, <Rdn>, <Rm> ; T2
-        if (!size.IsWide() && rd.Is(rn) && !rm.Is(sp)) {
+        if (!size.IsWide() && rd.Is(rn) && !rm.Is(sp) &&
+            (((!rd.IsPC() || OutsideITBlockAndAlOrLast(cond)) &&
+              (!rd.IsPC() || !rm.IsPC())) ||
+             AllowUnpredictable())) {
           EmitT32_16(0x4400 | (rd.GetCode() & 0x7) |
                      ((rd.GetCode() & 0x8) << 4) | (rm.GetCode() << 3));
           AdvanceIT();
           return;
         }
         // ADD{<c>}{<q>} {<Rdm>}, SP, <Rdm> ; T1
-        if (!size.IsWide() && rd.Is(rm) && rn.Is(sp)) {
+        if (!size.IsWide() && rd.Is(rm) && rn.Is(sp) &&
+            ((!rd.IsPC() || OutsideITBlockAndAlOrLast(cond)) ||
+             AllowUnpredictable())) {
           EmitT32_16(0x4468 | (rd.GetCode() & 0x7) |
                      ((rd.GetCode() & 0x8) << 4));
           AdvanceIT();
@@ -2109,7 +2131,8 @@ void Assembler::add(Condition cond,
     uint32_t amount = operand.GetShiftAmount();
     if (IsUsingT32()) {
       // ADD{<c>}{<q>} {<Rd>}, <Rn>, <Rm> {, <shift> #<amount> } ; T3
-      if (!size.IsNarrow() && shift.IsValidAmount(amount) && !rn.Is(sp)) {
+      if (!size.IsNarrow() && shift.IsValidAmount(amount) && !rn.Is(sp) &&
+          ((!rd.IsPC() && !rn.IsPC() && !rm.IsPC()) || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_32(0xeb000000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    rm.GetCode() | (operand.GetTypeEncodingValue() << 4) |
@@ -2118,7 +2141,8 @@ void Assembler::add(Condition cond,
         return;
       }
       // ADD{<c>}{<q>} {<Rd>}, SP, <Rm> {, <shift> #<amount> } ; T3
-      if (!size.IsNarrow() && rn.Is(sp) && shift.IsValidAmount(amount)) {
+      if (!size.IsNarrow() && rn.Is(sp) && shift.IsValidAmount(amount) &&
+          ((!rd.IsPC() && !rm.IsPC()) || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_32(0xeb0d0000U | (rd.GetCode() << 8) | rm.GetCode() |
                    (operand.GetTypeEncodingValue() << 4) |
@@ -2150,7 +2174,9 @@ void Assembler::add(Condition cond,
     Shift shift = operand.GetShift();
     if (IsUsingA32()) {
       // ADD{<c>}{<q>} {<Rd>}, <Rn>, <Rm>, <shift> <Rs> ; A1
-      if (cond.IsNotNever()) {
+      if (cond.IsNotNever() && ((!rd.IsPC() && !rn.IsPC() && !rm.IsPC() &&
+                                 !operand.GetShiftRegister().IsPC()) ||
+                                AllowUnpredictable())) {
         EmitA32(0x00800010U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
                 (shift.GetType() << 5) |
@@ -2180,7 +2206,10 @@ void Assembler::add(Condition cond, Register rd, const Operand& operand) {
     Register rm = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // ADD<c>{<q>} <Rdn>, <Rm> ; T2
-      if (InITBlock() && !rm.Is(sp)) {
+      if (InITBlock() && !rm.Is(sp) &&
+          (((!rd.IsPC() || OutsideITBlockAndAlOrLast(cond)) &&
+            (!rd.IsPC() || !rm.IsPC())) ||
+           AllowUnpredictable())) {
         EmitT32_16(0x4400 | (rd.GetCode() & 0x7) | ((rd.GetCode() & 0x8) << 4) |
                    (rm.GetCode() << 3));
         AdvanceIT();
@@ -2218,7 +2247,7 @@ void Assembler::adds(Condition cond,
       }
       // ADDS{<c>}{<q>} {<Rd>}, <Rn>, #<const> ; T3
       if (!size.IsNarrow() && immediate_t32.IsValid() && !rn.Is(sp) &&
-          !rd.Is(pc)) {
+          !rd.Is(pc) && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf1100000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    (immediate_t32.GetEncodingValue() & 0xff) |
                    ((immediate_t32.GetEncodingValue() & 0x700) << 4) |
@@ -2272,7 +2301,7 @@ void Assembler::adds(Condition cond,
     if (IsUsingT32()) {
       // ADDS{<c>}{<q>} {<Rd>}, <Rn>, <Rm> {, <shift> #<amount> } ; T3
       if (!size.IsNarrow() && shift.IsValidAmount(amount) && !rn.Is(sp) &&
-          !rd.Is(pc)) {
+          !rd.Is(pc) && ((!rn.IsPC() && !rm.IsPC()) || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_32(0xeb100000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    rm.GetCode() | (operand.GetTypeEncodingValue() << 4) |
@@ -2282,7 +2311,7 @@ void Assembler::adds(Condition cond,
       }
       // ADDS{<c>}{<q>} {<Rd>}, SP, <Rm> {, <shift> #<amount> } ; T3
       if (!size.IsNarrow() && rn.Is(sp) && shift.IsValidAmount(amount) &&
-          !rd.Is(pc)) {
+          !rd.Is(pc) && (!rm.IsPC() || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_32(0xeb1d0000U | (rd.GetCode() << 8) | rm.GetCode() |
                    (operand.GetTypeEncodingValue() << 4) |
@@ -2314,7 +2343,9 @@ void Assembler::adds(Condition cond,
     Shift shift = operand.GetShift();
     if (IsUsingA32()) {
       // ADDS{<c>}{<q>} {<Rd>}, <Rn>, <Rm>, <shift> <Rs> ; A1
-      if (cond.IsNotNever()) {
+      if (cond.IsNotNever() && ((!rd.IsPC() && !rn.IsPC() && !rm.IsPC() &&
+                                 !operand.GetShiftRegister().IsPC()) ||
+                                AllowUnpredictable())) {
         EmitA32(0x00900010U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
                 (shift.GetType() << 5) |
@@ -2353,21 +2384,22 @@ void Assembler::addw(Condition cond,
     uint32_t imm = operand.GetImmediate();
     if (IsUsingT32()) {
       // ADDW{<c>}{<q>} <Rd>, PC, #<imm12> ; T3
-      if (rn.Is(pc) && (imm <= 4095)) {
+      if (rn.Is(pc) && (imm <= 4095) && (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf20f0000U | (rd.GetCode() << 8) | (imm & 0xff) |
                    ((imm & 0x700) << 4) | ((imm & 0x800) << 15));
         AdvanceIT();
         return;
       }
       // ADDW{<c>}{<q>} {<Rd>}, <Rn>, #<imm12> ; T4
-      if ((imm <= 4095) && ((rn.GetCode() & 0xd) != 0xd)) {
+      if ((imm <= 4095) && ((rn.GetCode() & 0xd) != 0xd) &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf2000000U | (rd.GetCode() << 8) | (rn.GetCode() << 16) |
                    (imm & 0xff) | ((imm & 0x700) << 4) | ((imm & 0x800) << 15));
         AdvanceIT();
         return;
       }
       // ADDW{<c>}{<q>} {<Rd>}, SP, #<imm12> ; T4
-      if (rn.Is(sp) && (imm <= 4095)) {
+      if (rn.Is(sp) && (imm <= 4095) && (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf20d0000U | (rd.GetCode() << 8) | (imm & 0xff) |
                    ((imm & 0x700) << 4) | ((imm & 0x800) << 15));
         AdvanceIT();
@@ -2399,9 +2431,9 @@ void Assembler::adr(Condition cond,
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(0, 1020) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= 0) && (offset <= 1020) &&
                       ((offset & 0x3) == 0));
@@ -2415,7 +2447,7 @@ void Assembler::adr(Condition cond,
     }
     // ADR{<c>}{<q>} <Rd>, <label> ; T2
     if (!size.IsNarrow() && label->IsBound() && (neg_offset > 0) &&
-        (neg_offset <= 4095)) {
+        (neg_offset <= 4095) && (!rd.IsPC() || AllowUnpredictable())) {
       EmitT32_32(0xf2af0000U | (rd.GetCode() << 8) | (neg_offset & 0xff) |
                  ((neg_offset & 0x700) << 4) | ((neg_offset & 0x800) << 15));
       AdvanceIT();
@@ -2423,13 +2455,14 @@ void Assembler::adr(Condition cond,
     }
     // ADR{<c>}{<q>} <Rd>, <label> ; T3
     if (!size.IsNarrow() &&
-        (!label->IsBound() || ((offset >= 0) && (offset <= 4095)))) {
+        (!label->IsBound() || ((offset >= 0) && (offset <= 4095))) &&
+        (!rd.IsPC() || AllowUnpredictable())) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(0, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           int32_t target;
           if ((offset >= 0) && (offset <= 4095) && !label->IsMinusZero()) {
@@ -2457,9 +2490,9 @@ void Assembler::adr(Condition cond,
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(0, 255) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           int32_t target;
           ImmediateA32 positive_immediate_a32(offset);
@@ -2809,9 +2842,9 @@ void Assembler::b(Condition cond, EncodingSize size, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-256, 254) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= -256) && (offset <= 254) &&
                       ((offset & 0x1) == 0));
@@ -2832,9 +2865,9 @@ void Assembler::b(Condition cond, EncodingSize size, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-2048, 2046) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= -2048) && (offset <= 2046) &&
                       ((offset & 0x1) == 0));
@@ -2855,9 +2888,9 @@ void Assembler::b(Condition cond, EncodingSize size, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-1048576, 1048574) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= -1048576) && (offset <= 1048574) &&
                       ((offset & 0x1) == 0));
@@ -2880,9 +2913,9 @@ void Assembler::b(Condition cond, EncodingSize size, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-16777216, 16777214) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= -16777216) && (offset <= 16777214) &&
                       ((offset & 0x1) == 0));
@@ -2907,9 +2940,9 @@ void Assembler::b(Condition cond, EncodingSize size, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-33554432, 33554428) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= -33554432) && (offset <= 33554428) &&
                       ((offset & 0x3) == 0));
@@ -3194,9 +3227,9 @@ void Assembler::bl(Condition cond, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-16777216, 16777214) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= -16777216) && (offset <= 16777214) &&
                       ((offset & 0x1) == 0));
@@ -3221,9 +3254,9 @@ void Assembler::bl(Condition cond, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-33554432, 33554428) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= -33554432) && (offset <= 33554428) &&
                       ((offset & 0x3) == 0));
@@ -3254,9 +3287,9 @@ void Assembler::blx(Condition cond, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-16777216, 16777212) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -16777216) && (offset <= 16777212) &&
                       ((offset & 0x3) == 0));
@@ -3281,9 +3314,9 @@ void Assembler::blx(Condition cond, Label* label) {
         static class EmitOp : public Label::LabelEmitOperator {
          public:
           EmitOp() : Label::LabelEmitOperator(-33554432, 33554430) {}
-          uint32_t Encode(uint32_t instr,
-                          Label::Offset pc,
-                          const Label* label) const {
+          virtual uint32_t Encode(uint32_t instr,
+                                  Label::Offset pc,
+                                  const Label* label) const VIXL_OVERRIDE {
             Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
             VIXL_ASSERT((offset >= -33554432) && (offset <= 33554430) &&
                         ((offset & 0x1) == 0));
@@ -3369,9 +3402,9 @@ void Assembler::cbnz(Register rn, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(0, 126) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= 0) && (offset <= 126) &&
                       ((offset & 0x1) == 0));
@@ -3403,9 +3436,9 @@ void Assembler::cbz(Register rn, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(0, 126) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - pc;
           VIXL_ASSERT((offset >= 0) && (offset <= 126) &&
                       ((offset & 0x1) == 0));
@@ -4183,16 +4216,15 @@ void Assembler::lda(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDA{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d00fafU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // LDA{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01900c9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -4209,16 +4241,15 @@ void Assembler::ldab(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDAB{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d00f8fU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // LDAB{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01d00c9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -4235,16 +4266,15 @@ void Assembler::ldaex(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDAEX{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d00fefU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // LDAEX{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01900e9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -4261,16 +4291,15 @@ void Assembler::ldaexb(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDAEXB{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d00fcfU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // LDAEXB{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01d00e9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -4290,8 +4319,7 @@ void Assembler::ldaexd(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDAEXD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d000ffU | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
                    (rn.GetCode() << 16));
         AdvanceIT();
@@ -4300,7 +4328,7 @@ void Assembler::ldaexd(Condition cond,
     } else {
       // LDAEXD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
+          operand.IsOffset() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0) && !rn.IsPC()) ||
            AllowUnpredictable())) {
         EmitA32(0x01b00e9fU | (cond.GetCondition() << 28) |
@@ -4319,16 +4347,15 @@ void Assembler::ldaexh(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDAEXH{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d00fdfU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // LDAEXH{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01f00e9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -4345,16 +4372,15 @@ void Assembler::ldah(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDAH{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d00f9fU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // LDAH{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01f00c9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -4594,8 +4620,7 @@ void Assembler::ldr(Condition cond,
     if (IsUsingT32()) {
       // LDR{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm>}] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && (offset >= 0) &&
-          (offset <= 124) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == Offset)) {
+          (offset <= 124) && ((offset % 4) == 0) && operand.IsOffset()) {
         int32_t offset_ = offset >> 2;
         EmitT32_16(0x6800 | rt.GetCode() | (rn.GetCode() << 3) |
                    ((offset_ & 0x1f) << 6));
@@ -4604,8 +4629,7 @@ void Assembler::ldr(Condition cond,
       }
       // LDR{<c>}{<q>} <Rt>, [SP{, #{+}<imm>}] ; T2
       if (!size.IsWide() && rt.IsLow() && (offset >= 0) && (offset <= 1020) &&
-          ((offset % 4) == 0) && rn.Is(sp) &&
-          (operand.GetAddrMode() == Offset)) {
+          ((offset % 4) == 0) && rn.Is(sp) && operand.IsOffset()) {
         int32_t offset_ = offset >> 2;
         EmitT32_16(0x9800 | (rt.GetCode() << 8) | (offset_ & 0xff));
         AdvanceIT();
@@ -4613,7 +4637,7 @@ void Assembler::ldr(Condition cond,
       }
       // LDR{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm_1>}] ; T3
       if (!size.IsNarrow() && (offset >= 0) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8d00000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset & 0xfff));
         AdvanceIT();
@@ -4621,7 +4645,7 @@ void Assembler::ldr(Condition cond,
       }
       // LDR{<c>}{<q>} <Rt>, [<Rn>{, #-<imm_2>}] ; T4
       if (!size.IsNarrow() && (-offset >= 0) && (-offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8500c00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (-offset & 0xff));
         AdvanceIT();
@@ -4629,8 +4653,7 @@ void Assembler::ldr(Condition cond,
       }
       // LDR{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_2> ; T4
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8500900U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -4640,8 +4663,7 @@ void Assembler::ldr(Condition cond,
       }
       // LDR{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}]! ; T4
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8500d00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -4651,7 +4673,7 @@ void Assembler::ldr(Condition cond,
       }
       // LDR{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm>] ; T2
       if (!size.IsNarrow() && (offset >= -4095) && (offset <= 4095) &&
-          rn.Is(pc) && (operand.GetAddrMode() == Offset)) {
+          rn.Is(pc) && operand.IsOffset()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf85f0000U | (rt.GetCode() << 12) | offset_ | (sign << 23));
@@ -4660,9 +4682,8 @@ void Assembler::ldr(Condition cond,
       }
     } else {
       // LDR{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}] ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsOffset() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x05100000U | (cond.GetCondition() << 28) |
@@ -4671,9 +4692,8 @@ void Assembler::ldr(Condition cond,
         return;
       }
       // LDR{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_3> ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsPostIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x04100000U | (cond.GetCondition() << 28) |
@@ -4682,9 +4702,8 @@ void Assembler::ldr(Condition cond,
         return;
       }
       // LDR{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}]! ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsPreIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x05300000U | (cond.GetCondition() << 28) |
@@ -4694,7 +4713,7 @@ void Assembler::ldr(Condition cond,
       }
       // LDR{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm_1>] ; A1
       if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+          operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x051f0000U | (cond.GetCondition() << 28) |
@@ -4710,7 +4729,7 @@ void Assembler::ldr(Condition cond,
     if (IsUsingT32()) {
       // LDR{<c>}{<q>} <Rt>, [<Rn>, #{+}<Rm>] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && rm.IsLow() &&
-          sign.IsPlus() && (operand.GetAddrMode() == Offset)) {
+          sign.IsPlus() && operand.IsOffset()) {
         EmitT32_16(0x5800 | rt.GetCode() | (rn.GetCode() << 3) |
                    (rm.GetCode() << 6));
         AdvanceIT();
@@ -4727,7 +4746,7 @@ void Assembler::ldr(Condition cond,
     if (IsUsingT32()) {
       // LDR{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>{, LSL #<imm>}] ; T2
       if (!size.IsNarrow() && sign.IsPlus() && shift.IsLSL() && (amount <= 3) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8500000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    rm.GetCode() | (amount << 4));
         AdvanceIT();
@@ -4735,8 +4754,7 @@ void Assembler::ldr(Condition cond,
       }
     } else {
       // LDR{<c>}{<q>} <Rt>, [<Rn>, {+/-}<Rm>{, <shift>}] ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever()) {
+      if (operand.IsShiftValid() && operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
         uint32_t imm_and_type_ = (((amount % 32) << 2) | shift_);
@@ -4746,7 +4764,7 @@ void Assembler::ldr(Condition cond,
         return;
       }
       // LDR{<c>}{<q>} <Rt>, [<Rn>], {+/-}<Rm>{, <shift>} ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == PostIndex) &&
+      if (operand.IsShiftValid() && operand.IsPostIndex() &&
           cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
@@ -4757,8 +4775,7 @@ void Assembler::ldr(Condition cond,
         return;
       }
       // LDR{<c>}{<q>} <Rt>, [<Rn>, {+/-}<Rm>{, <shift>}]! ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == PreIndex) &&
-          cond.IsNotNever()) {
+      if (operand.IsShiftValid() && operand.IsPreIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
         uint32_t imm_and_type_ = (((amount % 32) << 2) | shift_);
@@ -4792,9 +4809,9 @@ void Assembler::ldr(Condition cond,
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(0, 1020) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= 0) && (offset <= 1020) &&
                       ((offset & 0x3) == 0));
@@ -4813,9 +4830,9 @@ void Assembler::ldr(Condition cond,
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -4835,9 +4852,9 @@ void Assembler::ldr(Condition cond,
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -4867,7 +4884,7 @@ void Assembler::ldrb(Condition cond,
     if (IsUsingT32()) {
       // LDRB{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm>}] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && (offset >= 0) &&
-          (offset <= 31) && (operand.GetAddrMode() == Offset)) {
+          (offset <= 31) && operand.IsOffset()) {
         EmitT32_16(0x7800 | rt.GetCode() | (rn.GetCode() << 3) |
                    ((offset & 0x1f) << 6));
         AdvanceIT();
@@ -4875,8 +4892,7 @@ void Assembler::ldrb(Condition cond,
       }
       // LDRB{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm_1>}] ; T2
       if (!size.IsNarrow() && (offset >= 0) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf8900000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset & 0xfff));
         AdvanceIT();
@@ -4884,8 +4900,7 @@ void Assembler::ldrb(Condition cond,
       }
       // LDRB{<c>}{<q>} <Rt>, [<Rn>{, #-<imm_2>}] ; T3
       if (!size.IsNarrow() && (-offset >= 0) && (-offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf8100c00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (-offset & 0xff));
         AdvanceIT();
@@ -4893,8 +4908,7 @@ void Assembler::ldrb(Condition cond,
       }
       // LDRB{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_2> ; T3
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8100900U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -4904,8 +4918,7 @@ void Assembler::ldrb(Condition cond,
       }
       // LDRB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}]! ; T3
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8100d00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -4915,7 +4928,7 @@ void Assembler::ldrb(Condition cond,
       }
       // LDRB{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm>] ; T1
       if (!size.IsNarrow() && (offset >= -4095) && (offset <= 4095) &&
-          rn.Is(pc) && (operand.GetAddrMode() == Offset) && !rt.Is(pc)) {
+          rn.Is(pc) && operand.IsOffset() && !rt.Is(pc)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf81f0000U | (rt.GetCode() << 12) | offset_ | (sign << 23));
@@ -4924,9 +4937,8 @@ void Assembler::ldrb(Condition cond,
       }
     } else {
       // LDRB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}] ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsOffset() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x05500000U | (cond.GetCondition() << 28) |
@@ -4935,9 +4947,8 @@ void Assembler::ldrb(Condition cond,
         return;
       }
       // LDRB{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_3> ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsPostIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x04500000U | (cond.GetCondition() << 28) |
@@ -4946,9 +4957,8 @@ void Assembler::ldrb(Condition cond,
         return;
       }
       // LDRB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}]! ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsPreIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x05700000U | (cond.GetCondition() << 28) |
@@ -4958,7 +4968,7 @@ void Assembler::ldrb(Condition cond,
       }
       // LDRB{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm_1>] ; A1
       if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+          operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x055f0000U | (cond.GetCondition() << 28) |
@@ -4974,7 +4984,7 @@ void Assembler::ldrb(Condition cond,
     if (IsUsingT32()) {
       // LDRB{<c>}{<q>} <Rt>, [<Rn>, #{+}<Rm>] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && rm.IsLow() &&
-          sign.IsPlus() && (operand.GetAddrMode() == Offset)) {
+          sign.IsPlus() && operand.IsOffset()) {
         EmitT32_16(0x5c00 | rt.GetCode() | (rn.GetCode() << 3) |
                    (rm.GetCode() << 6));
         AdvanceIT();
@@ -4991,8 +5001,7 @@ void Assembler::ldrb(Condition cond,
     if (IsUsingT32()) {
       // LDRB{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>{, LSL #<imm>}] ; T2
       if (!size.IsNarrow() && sign.IsPlus() && shift.IsLSL() && (amount <= 3) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf8100000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    rm.GetCode() | (amount << 4));
         AdvanceIT();
@@ -5000,8 +5009,7 @@ void Assembler::ldrb(Condition cond,
       }
     } else {
       // LDRB{<c>}{<q>} <Rt>, [<Rn>, {+/-}<Rm>{, <shift>}] ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever()) {
+      if (operand.IsShiftValid() && operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
         uint32_t imm_and_type_ = (((amount % 32) << 2) | shift_);
@@ -5011,7 +5019,7 @@ void Assembler::ldrb(Condition cond,
         return;
       }
       // LDRB{<c>}{<q>} <Rt>, [<Rn>], {+/-}<Rm>{, <shift>} ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == PostIndex) &&
+      if (operand.IsShiftValid() && operand.IsPostIndex() &&
           cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
@@ -5022,8 +5030,7 @@ void Assembler::ldrb(Condition cond,
         return;
       }
       // LDRB{<c>}{<q>} <Rt>, [<Rn>, {+/-}<Rm>{, <shift>}]! ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == PreIndex) &&
-          cond.IsNotNever()) {
+      if (operand.IsShiftValid() && operand.IsPreIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
         uint32_t imm_and_type_ = (((amount % 32) << 2) | shift_);
@@ -5053,9 +5060,9 @@ void Assembler::ldrb(Condition cond, Register rt, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -5075,9 +5082,9 @@ void Assembler::ldrb(Condition cond, Register rt, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -5107,7 +5114,7 @@ void Assembler::ldrd(Condition cond,
     if (IsUsingT32()) {
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>{, #{+/-}<imm>}] ; T1
       if ((offset >= -1020) && (offset <= 1020) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xe9500000U | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
@@ -5117,8 +5124,7 @@ void Assembler::ldrd(Condition cond,
       }
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>], #{+/-}<imm> ; T1
       if ((offset >= -1020) && (offset <= 1020) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xe8700000U | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
@@ -5128,8 +5134,7 @@ void Assembler::ldrd(Condition cond,
       }
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>{, #{+/-}<imm>}]! ; T1
       if ((offset >= -1020) && (offset <= 1020) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xe9700000U | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
@@ -5139,7 +5144,7 @@ void Assembler::ldrd(Condition cond,
       }
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [PC, #<_plusminus_><imm>] ; T1
       if ((offset >= -255) && (offset <= 255) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset)) {
+          operand.IsOffset()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xe95f0000U | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
@@ -5150,9 +5155,8 @@ void Assembler::ldrd(Condition cond,
     } else {
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>{, #{+/-}<imm_1>}] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf) &&
+          (offset >= -255) && (offset <= 255) && operand.IsOffset() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf) &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
@@ -5163,9 +5167,8 @@ void Assembler::ldrd(Condition cond,
       }
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>], #{+/-}<imm_1> ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf) &&
+          (offset >= -255) && (offset <= 255) && operand.IsPostIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf) &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
@@ -5176,9 +5179,8 @@ void Assembler::ldrd(Condition cond,
       }
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>{, #{+/-}<imm_1>}]! ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf) &&
+          (offset >= -255) && (offset <= 255) && operand.IsPreIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf) &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
@@ -5190,7 +5192,7 @@ void Assembler::ldrd(Condition cond,
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [PC, #<_plusminus_><imm_1>] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
           (offset >= -255) && (offset <= 255) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
+          operand.IsOffset() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
@@ -5208,7 +5210,7 @@ void Assembler::ldrd(Condition cond,
     if (IsUsingA32()) {
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>, #{+/-}<Rm>] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
+          operand.IsOffset() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x010000d0U | (cond.GetCondition() << 28) |
@@ -5218,7 +5220,7 @@ void Assembler::ldrd(Condition cond,
       }
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>], #{+/-}<Rm> ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
+          operand.IsPostIndex() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x000000d0U | (cond.GetCondition() << 28) |
@@ -5228,7 +5230,7 @@ void Assembler::ldrd(Condition cond,
       }
       // LDRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>, #{+/-}<Rm>]! ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
+          operand.IsPreIndex() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x012000d0U | (cond.GetCondition() << 28) |
@@ -5257,9 +5259,9 @@ void Assembler::ldrd(Condition cond, Register rt, Register rt2, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-1020, 1020) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -1020) && (offset <= 1020) &&
                       ((offset & 0x3) == 0));
@@ -5285,9 +5287,9 @@ void Assembler::ldrd(Condition cond, Register rt, Register rt2, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-255, 255) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -255) && (offset <= 255));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -5315,7 +5317,7 @@ void Assembler::ldrex(Condition cond, Register rt, const MemOperand& operand) {
     if (IsUsingT32()) {
       // LDREX{<c>}{<q>} <Rt>, [<Rn>{, #<imm>}] ; T1
       if ((offset >= 0) && (offset <= 1020) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == Offset)) {
+          operand.IsOffset()) {
         int32_t offset_ = offset >> 2;
         EmitT32_32(0xe8500f00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset_ & 0xff));
@@ -5324,8 +5326,7 @@ void Assembler::ldrex(Condition cond, Register rt, const MemOperand& operand) {
       }
     } else {
       // LDREX{<c>}{<q>} <Rt>, [<Rn>{, #<imm_1>}] ; A1
-      if ((offset == 0) && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever()) {
+      if ((offset == 0) && operand.IsOffset() && cond.IsNotNever()) {
         EmitA32(0x01900f9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -5342,16 +5343,15 @@ void Assembler::ldrexb(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDREXB{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d00f4fU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // LDREXB{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01d00f9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -5371,8 +5371,7 @@ void Assembler::ldrexd(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDREXD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d0007fU | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
                    (rn.GetCode() << 16));
         AdvanceIT();
@@ -5381,7 +5380,7 @@ void Assembler::ldrexd(Condition cond,
     } else {
       // LDREXD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
+          operand.IsOffset() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0) && !rn.IsPC()) ||
            AllowUnpredictable())) {
         EmitA32(0x01b00f9fU | (cond.GetCondition() << 28) |
@@ -5400,16 +5399,15 @@ void Assembler::ldrexh(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // LDREXH{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8d00f5fU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // LDREXH{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01f00f9fU | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16));
         return;
@@ -5431,8 +5429,7 @@ void Assembler::ldrh(Condition cond,
     if (IsUsingT32()) {
       // LDRH{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm>}] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && (offset >= 0) &&
-          (offset <= 62) && ((offset % 2) == 0) &&
-          (operand.GetAddrMode() == Offset)) {
+          (offset <= 62) && ((offset % 2) == 0) && operand.IsOffset()) {
         int32_t offset_ = offset >> 1;
         EmitT32_16(0x8800 | rt.GetCode() | (rn.GetCode() << 3) |
                    ((offset_ & 0x1f) << 6));
@@ -5441,8 +5438,7 @@ void Assembler::ldrh(Condition cond,
       }
       // LDRH{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm_1>}] ; T2
       if (!size.IsNarrow() && (offset >= 0) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf8b00000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset & 0xfff));
         AdvanceIT();
@@ -5450,8 +5446,7 @@ void Assembler::ldrh(Condition cond,
       }
       // LDRH{<c>}{<q>} <Rt>, [<Rn>{, #-<imm_2>}] ; T3
       if (!size.IsNarrow() && (-offset >= 0) && (-offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf8300c00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (-offset & 0xff));
         AdvanceIT();
@@ -5459,8 +5454,7 @@ void Assembler::ldrh(Condition cond,
       }
       // LDRH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_2> ; T3
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8300900U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -5470,8 +5464,7 @@ void Assembler::ldrh(Condition cond,
       }
       // LDRH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}]! ; T3
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8300d00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -5481,7 +5474,7 @@ void Assembler::ldrh(Condition cond,
       }
       // LDRH{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm>] ; T1
       if (!size.IsNarrow() && (offset >= -4095) && (offset <= 4095) &&
-          rn.Is(pc) && (operand.GetAddrMode() == Offset) && !rt.Is(pc)) {
+          rn.Is(pc) && operand.IsOffset() && !rt.Is(pc)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf83f0000U | (rt.GetCode() << 12) | offset_ | (sign << 23));
@@ -5490,9 +5483,8 @@ void Assembler::ldrh(Condition cond,
       }
     } else {
       // LDRH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}] ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsOffset() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x015000b0U | (cond.GetCondition() << 28) |
@@ -5501,9 +5493,8 @@ void Assembler::ldrh(Condition cond,
         return;
       }
       // LDRH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_3> ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsPostIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x005000b0U | (cond.GetCondition() << 28) |
@@ -5512,9 +5503,8 @@ void Assembler::ldrh(Condition cond,
         return;
       }
       // LDRH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}]! ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsPreIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x017000b0U | (cond.GetCondition() << 28) |
@@ -5524,7 +5514,7 @@ void Assembler::ldrh(Condition cond,
       }
       // LDRH{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm_1>] ; A1
       if ((offset >= -255) && (offset <= 255) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+          operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x015f00b0U | (cond.GetCondition() << 28) |
@@ -5541,7 +5531,7 @@ void Assembler::ldrh(Condition cond,
     if (IsUsingT32()) {
       // LDRH{<c>}{<q>} <Rt>, [<Rn>, #{+}<Rm>] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && rm.IsLow() &&
-          sign.IsPlus() && (operand.GetAddrMode() == Offset)) {
+          sign.IsPlus() && operand.IsOffset()) {
         EmitT32_16(0x5a00 | rt.GetCode() | (rn.GetCode() << 3) |
                    (rm.GetCode() << 6));
         AdvanceIT();
@@ -5549,7 +5539,7 @@ void Assembler::ldrh(Condition cond,
       }
     } else {
       // LDRH{<c>}{<q>} <Rt>, [<Rn>, #{+/-}<Rm>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+      if (operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x011000b0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -5557,7 +5547,7 @@ void Assembler::ldrh(Condition cond,
         return;
       }
       // LDRH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<Rm> ; A1
-      if ((operand.GetAddrMode() == PostIndex) && cond.IsNotNever()) {
+      if (operand.IsPostIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x001000b0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -5565,7 +5555,7 @@ void Assembler::ldrh(Condition cond,
         return;
       }
       // LDRH{<c>}{<q>} <Rt>, [<Rn>, #{+/-}<Rm>]! ; A1
-      if ((operand.GetAddrMode() == PreIndex) && cond.IsNotNever()) {
+      if (operand.IsPreIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x013000b0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -5583,8 +5573,7 @@ void Assembler::ldrh(Condition cond,
     if (IsUsingT32()) {
       // LDRH{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>{, LSL #<imm>}] ; T2
       if (!size.IsNarrow() && sign.IsPlus() && shift.IsLSL() && (amount <= 3) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf8300000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    rm.GetCode() | (amount << 4));
         AdvanceIT();
@@ -5611,9 +5600,9 @@ void Assembler::ldrh(Condition cond, Register rt, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -5633,9 +5622,9 @@ void Assembler::ldrh(Condition cond, Register rt, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-255, 255) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -255) && (offset <= 255));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -5666,8 +5655,7 @@ void Assembler::ldrsb(Condition cond,
     if (IsUsingT32()) {
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm>}] ; T1
       if (!size.IsNarrow() && (offset >= 0) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf9900000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset & 0xfff));
         AdvanceIT();
@@ -5675,8 +5663,7 @@ void Assembler::ldrsb(Condition cond,
       }
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>{, #-<imm_1>}] ; T2
       if (!size.IsNarrow() && (-offset >= 0) && (-offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf9100c00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (-offset & 0xff));
         AdvanceIT();
@@ -5684,8 +5671,7 @@ void Assembler::ldrsb(Condition cond,
       }
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_1> ; T2
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf9100900U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -5695,8 +5681,7 @@ void Assembler::ldrsb(Condition cond,
       }
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_1>}]! ; T2
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf9100d00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -5706,7 +5691,7 @@ void Assembler::ldrsb(Condition cond,
       }
       // LDRSB{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm>] ; T1
       if (!size.IsNarrow() && (offset >= -4095) && (offset <= 4095) &&
-          rn.Is(pc) && (operand.GetAddrMode() == Offset) && !rt.Is(pc)) {
+          rn.Is(pc) && operand.IsOffset() && !rt.Is(pc)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf91f0000U | (rt.GetCode() << 12) | offset_ | (sign << 23));
@@ -5715,9 +5700,8 @@ void Assembler::ldrsb(Condition cond,
       }
     } else {
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}] ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsOffset() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x015000d0U | (cond.GetCondition() << 28) |
@@ -5726,9 +5710,8 @@ void Assembler::ldrsb(Condition cond,
         return;
       }
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_2> ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsPostIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x005000d0U | (cond.GetCondition() << 28) |
@@ -5737,9 +5720,8 @@ void Assembler::ldrsb(Condition cond,
         return;
       }
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}]! ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsPreIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x017000d0U | (cond.GetCondition() << 28) |
@@ -5749,7 +5731,7 @@ void Assembler::ldrsb(Condition cond,
       }
       // LDRSB{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm_1>] ; A1
       if ((offset >= -255) && (offset <= 255) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+          operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x015f00d0U | (cond.GetCondition() << 28) |
@@ -5766,7 +5748,7 @@ void Assembler::ldrsb(Condition cond,
     if (IsUsingT32()) {
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>, #{+}<Rm>] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && rm.IsLow() &&
-          sign.IsPlus() && (operand.GetAddrMode() == Offset)) {
+          sign.IsPlus() && operand.IsOffset()) {
         EmitT32_16(0x5600 | rt.GetCode() | (rn.GetCode() << 3) |
                    (rm.GetCode() << 6));
         AdvanceIT();
@@ -5774,7 +5756,7 @@ void Assembler::ldrsb(Condition cond,
       }
     } else {
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>, #{+/-}<Rm>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+      if (operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x011000d0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -5782,7 +5764,7 @@ void Assembler::ldrsb(Condition cond,
         return;
       }
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<Rm> ; A1
-      if ((operand.GetAddrMode() == PostIndex) && cond.IsNotNever()) {
+      if (operand.IsPostIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x001000d0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -5790,7 +5772,7 @@ void Assembler::ldrsb(Condition cond,
         return;
       }
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>, #{+/-}<Rm>]! ; A1
-      if ((operand.GetAddrMode() == PreIndex) && cond.IsNotNever()) {
+      if (operand.IsPreIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x013000d0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -5808,8 +5790,7 @@ void Assembler::ldrsb(Condition cond,
     if (IsUsingT32()) {
       // LDRSB{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>{, LSL #<imm>}] ; T2
       if (!size.IsNarrow() && sign.IsPlus() && shift.IsLSL() && (amount <= 3) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf9100000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    rm.GetCode() | (amount << 4));
         AdvanceIT();
@@ -5836,9 +5817,9 @@ void Assembler::ldrsb(Condition cond, Register rt, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -5858,9 +5839,9 @@ void Assembler::ldrsb(Condition cond, Register rt, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-255, 255) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -255) && (offset <= 255));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -5891,8 +5872,7 @@ void Assembler::ldrsh(Condition cond,
     if (IsUsingT32()) {
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm>}] ; T1
       if (!size.IsNarrow() && (offset >= 0) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf9b00000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset & 0xfff));
         AdvanceIT();
@@ -5900,8 +5880,7 @@ void Assembler::ldrsh(Condition cond,
       }
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>{, #-<imm_1>}] ; T2
       if (!size.IsNarrow() && (-offset >= 0) && (-offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf9300c00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (-offset & 0xff));
         AdvanceIT();
@@ -5909,8 +5888,7 @@ void Assembler::ldrsh(Condition cond,
       }
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_1> ; T2
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf9300900U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -5920,8 +5898,7 @@ void Assembler::ldrsh(Condition cond,
       }
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_1>}]! ; T2
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf9300d00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -5931,7 +5908,7 @@ void Assembler::ldrsh(Condition cond,
       }
       // LDRSH{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm>] ; T1
       if (!size.IsNarrow() && (offset >= -4095) && (offset <= 4095) &&
-          rn.Is(pc) && (operand.GetAddrMode() == Offset) && !rt.Is(pc)) {
+          rn.Is(pc) && operand.IsOffset() && !rt.Is(pc)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf93f0000U | (rt.GetCode() << 12) | offset_ | (sign << 23));
@@ -5940,9 +5917,8 @@ void Assembler::ldrsh(Condition cond,
       }
     } else {
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}] ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsOffset() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x015000f0U | (cond.GetCondition() << 28) |
@@ -5951,9 +5927,8 @@ void Assembler::ldrsh(Condition cond,
         return;
       }
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_2> ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsPostIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x005000f0U | (cond.GetCondition() << 28) |
@@ -5962,9 +5937,8 @@ void Assembler::ldrsh(Condition cond,
         return;
       }
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}]! ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsPreIndex() &&
+          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x017000f0U | (cond.GetCondition() << 28) |
@@ -5974,7 +5948,7 @@ void Assembler::ldrsh(Condition cond,
       }
       // LDRSH{<c>}{<q>} <Rt>, [PC, #<_plusminus_><imm_1>] ; A1
       if ((offset >= -255) && (offset <= 255) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+          operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x015f00f0U | (cond.GetCondition() << 28) |
@@ -5991,7 +5965,7 @@ void Assembler::ldrsh(Condition cond,
     if (IsUsingT32()) {
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>, #{+}<Rm>] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && rm.IsLow() &&
-          sign.IsPlus() && (operand.GetAddrMode() == Offset)) {
+          sign.IsPlus() && operand.IsOffset()) {
         EmitT32_16(0x5e00 | rt.GetCode() | (rn.GetCode() << 3) |
                    (rm.GetCode() << 6));
         AdvanceIT();
@@ -5999,7 +5973,7 @@ void Assembler::ldrsh(Condition cond,
       }
     } else {
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>, #{+/-}<Rm>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+      if (operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x011000f0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -6007,7 +5981,7 @@ void Assembler::ldrsh(Condition cond,
         return;
       }
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<Rm> ; A1
-      if ((operand.GetAddrMode() == PostIndex) && cond.IsNotNever()) {
+      if (operand.IsPostIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x001000f0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -6015,7 +5989,7 @@ void Assembler::ldrsh(Condition cond,
         return;
       }
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>, #{+/-}<Rm>]! ; A1
-      if ((operand.GetAddrMode() == PreIndex) && cond.IsNotNever()) {
+      if (operand.IsPreIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x013000f0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -6033,8 +6007,7 @@ void Assembler::ldrsh(Condition cond,
     if (IsUsingT32()) {
       // LDRSH{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>{, LSL #<imm>}] ; T2
       if (!size.IsNarrow() && sign.IsPlus() && shift.IsLSL() && (amount <= 3) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf) &&
-          !rt.Is(pc)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf) && !rt.Is(pc)) {
         EmitT32_32(0xf9300000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    rm.GetCode() | (amount << 4));
         AdvanceIT();
@@ -6061,9 +6034,9 @@ void Assembler::ldrsh(Condition cond, Register rt, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -6083,9 +6056,9 @@ void Assembler::ldrsh(Condition cond, Register rt, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-255, 255) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -255) && (offset <= 255));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -6430,7 +6403,9 @@ void Assembler::mov(Condition cond,
     if (operand.IsPlainRegister()) {
       if (IsUsingT32()) {
         // MOV{<c>}{<q>} <Rd>, <Rm> ; T1
-        if (!size.IsWide()) {
+        if (!size.IsWide() &&
+            ((!rd.IsPC() || OutsideITBlockAndAlOrLast(cond)) ||
+             AllowUnpredictable())) {
           EmitT32_16(0x4600 | (rd.GetCode() & 0x7) |
                      ((rd.GetCode() & 0x8) << 4) | (rm.GetCode() << 3));
           AdvanceIT();
@@ -6444,7 +6419,8 @@ void Assembler::mov(Condition cond,
       // MOV<c>{<q>} <Rd>, <Rm> {, <shift> #<amount> } ; T2
       if (InITBlock() && !size.IsWide() && rd.IsLow() &&
           shift.IsValidAmount(amount) && rm.IsLow() &&
-          (shift.Is(LSL) || shift.Is(LSR) || shift.Is(ASR))) {
+          (shift.Is(LSL) || shift.Is(LSR) || shift.Is(ASR)) &&
+          ((!shift.Is(LSL) || (amount != 0)) || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_16(0x0000 | rd.GetCode() | (rm.GetCode() << 3) |
                    (operand.GetTypeEncodingValue() << 11) | (amount_ << 6));
@@ -6452,7 +6428,8 @@ void Assembler::mov(Condition cond,
         return;
       }
       // MOV{<c>}{<q>} <Rd>, <Rm> {, <shift> #<amount> } ; T3
-      if (!size.IsNarrow() && shift.IsValidAmount(amount)) {
+      if (!size.IsNarrow() && shift.IsValidAmount(amount) &&
+          ((!rd.IsPC() && !rm.IsPC()) || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_32(0xea4f0000U | (rd.GetCode() << 8) | rm.GetCode() |
                    (operand.GetTypeEncodingValue() << 4) |
@@ -6508,7 +6485,9 @@ void Assembler::mov(Condition cond,
         return;
       }
       // MOV{<c>}{<q>} <Rd>, <Rm>, <shift> <Rs> ; T2
-      if (!size.IsNarrow()) {
+      if (!size.IsNarrow() &&
+          ((!rd.IsPC() && !rm.IsPC() && !operand.GetShiftRegister().IsPC()) ||
+           AllowUnpredictable())) {
         EmitT32_32(0xfa00f000U | (rd.GetCode() << 8) | (rm.GetCode() << 16) |
                    (shift.GetType() << 21) |
                    operand.GetShiftRegister().GetCode());
@@ -6517,7 +6496,9 @@ void Assembler::mov(Condition cond,
       }
     } else {
       // MOV{<c>}{<q>} <Rd>, <Rm>, <shift> <Rs> ; A1
-      if (cond.IsNotNever()) {
+      if (cond.IsNotNever() &&
+          ((!rd.IsPC() && !rm.IsPC() && !operand.GetShiftRegister().IsPC()) ||
+           AllowUnpredictable())) {
         EmitA32(0x01a00010U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rm.GetCode() | (shift.GetType() << 5) |
                 (operand.GetShiftRegister().GetCode() << 8));
@@ -6536,7 +6517,8 @@ void Assembler::mov(Condition cond,
         return;
       }
       // MOV{<c>}{<q>} <Rd>, #<const> ; T2
-      if (!size.IsNarrow() && immediate_t32.IsValid()) {
+      if (!size.IsNarrow() && immediate_t32.IsValid() &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf04f0000U | (rd.GetCode() << 8) |
                    (immediate_t32.GetEncodingValue() & 0xff) |
                    ((immediate_t32.GetEncodingValue() & 0x700) << 4) |
@@ -6545,7 +6527,8 @@ void Assembler::mov(Condition cond,
         return;
       }
       // MOV{<c>}{<q>} <Rd>, #<imm16> ; T3
-      if (!size.IsNarrow() && (imm <= 65535)) {
+      if (!size.IsNarrow() && (imm <= 65535) &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf2400000U | (rd.GetCode() << 8) | (imm & 0xff) |
                    ((imm & 0x700) << 4) | ((imm & 0x800) << 15) |
                    ((imm & 0xf000) << 4));
@@ -6561,7 +6544,8 @@ void Assembler::mov(Condition cond,
         return;
       }
       // MOV{<c>}{<q>} <Rd>, #<imm16> ; A2
-      if ((imm <= 65535) && cond.IsNotNever()) {
+      if ((imm <= 65535) && cond.IsNotNever() &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitA32(0x03000000U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | (imm & 0xfff) | ((imm & 0xf000) << 4));
         return;
@@ -6593,7 +6577,8 @@ void Assembler::movs(Condition cond,
         return;
       }
       // MOVS{<c>}{<q>} <Rd>, <Rm> {, <shift> #<amount> } ; T3
-      if (!size.IsNarrow() && shift.IsValidAmount(amount)) {
+      if (!size.IsNarrow() && shift.IsValidAmount(amount) &&
+          ((!rd.IsPC() && !rm.IsPC()) || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitT32_32(0xea5f0000U | (rd.GetCode() << 8) | rm.GetCode() |
                    (operand.GetTypeEncodingValue() << 4) |
@@ -6603,7 +6588,8 @@ void Assembler::movs(Condition cond,
       }
     } else {
       // MOVS{<c>}{<q>} <Rd>, <Rm> {, <shift> #<amount> } ; A1
-      if (shift.IsValidAmount(amount) && cond.IsNotNever()) {
+      if (shift.IsValidAmount(amount) && cond.IsNotNever() &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         uint32_t amount_ = amount % 32;
         EmitA32(0x01b00000U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rm.GetCode() |
@@ -6649,7 +6635,9 @@ void Assembler::movs(Condition cond,
         return;
       }
       // MOVS{<c>}{<q>} <Rd>, <Rm>, <shift> <Rs> ; T2
-      if (!size.IsNarrow()) {
+      if (!size.IsNarrow() &&
+          ((!rd.IsPC() && !rm.IsPC() && !operand.GetShiftRegister().IsPC()) ||
+           AllowUnpredictable())) {
         EmitT32_32(0xfa10f000U | (rd.GetCode() << 8) | (rm.GetCode() << 16) |
                    (shift.GetType() << 21) |
                    operand.GetShiftRegister().GetCode());
@@ -6658,7 +6646,9 @@ void Assembler::movs(Condition cond,
       }
     } else {
       // MOVS{<c>}{<q>} <Rd>, <Rm>, <shift> <Rs> ; A1
-      if (cond.IsNotNever()) {
+      if (cond.IsNotNever() &&
+          ((!rd.IsPC() && !rm.IsPC() && !operand.GetShiftRegister().IsPC()) ||
+           AllowUnpredictable())) {
         EmitA32(0x01b00010U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rm.GetCode() | (shift.GetType() << 5) |
                 (operand.GetShiftRegister().GetCode() << 8));
@@ -6677,7 +6667,8 @@ void Assembler::movs(Condition cond,
         return;
       }
       // MOVS{<c>}{<q>} <Rd>, #<const> ; T2
-      if (!size.IsNarrow() && immediate_t32.IsValid()) {
+      if (!size.IsNarrow() && immediate_t32.IsValid() &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf05f0000U | (rd.GetCode() << 8) |
                    (immediate_t32.GetEncodingValue() & 0xff) |
                    ((immediate_t32.GetEncodingValue() & 0x700) << 4) |
@@ -6705,7 +6696,7 @@ void Assembler::movt(Condition cond, Register rd, const Operand& operand) {
     uint32_t imm = operand.GetImmediate();
     if (IsUsingT32()) {
       // MOVT{<c>}{<q>} <Rd>, #<imm16> ; T1
-      if ((imm <= 65535)) {
+      if ((imm <= 65535) && (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf2c00000U | (rd.GetCode() << 8) | (imm & 0xff) |
                    ((imm & 0x700) << 4) | ((imm & 0x800) << 15) |
                    ((imm & 0xf000) << 4));
@@ -6714,7 +6705,8 @@ void Assembler::movt(Condition cond, Register rd, const Operand& operand) {
       }
     } else {
       // MOVT{<c>}{<q>} <Rd>, #<imm16> ; A1
-      if ((imm <= 65535) && cond.IsNotNever()) {
+      if ((imm <= 65535) && cond.IsNotNever() &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitA32(0x03400000U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | (imm & 0xfff) | ((imm & 0xf000) << 4));
         return;
@@ -6731,7 +6723,7 @@ void Assembler::movw(Condition cond, Register rd, const Operand& operand) {
     uint32_t imm = operand.GetImmediate();
     if (IsUsingT32()) {
       // MOVW{<c>}{<q>} <Rd>, #<imm16> ; T3
-      if ((imm <= 65535)) {
+      if ((imm <= 65535) && (!rd.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xf2400000U | (rd.GetCode() << 8) | (imm & 0xff) |
                    ((imm & 0x700) << 4) | ((imm & 0x800) << 15) |
                    ((imm & 0xf000) << 4));
@@ -6740,7 +6732,8 @@ void Assembler::movw(Condition cond, Register rd, const Operand& operand) {
       }
     } else {
       // MOVW{<c>}{<q>} <Rd>, #<imm16> ; A2
-      if ((imm <= 65535) && cond.IsNotNever()) {
+      if ((imm <= 65535) && cond.IsNotNever() &&
+          (!rd.IsPC() || AllowUnpredictable())) {
         EmitA32(0x03000000U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | (imm & 0xfff) | ((imm & 0xf000) << 4));
         return;
@@ -7376,9 +7369,9 @@ void Assembler::pld(Condition cond, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -7398,9 +7391,9 @@ void Assembler::pld(Condition cond, Label* label) {
         static class EmitOp : public Label::LabelEmitOperator {
          public:
           EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-          uint32_t Encode(uint32_t instr,
-                          Label::Offset pc,
-                          const Label* label) const {
+          virtual uint32_t Encode(uint32_t instr,
+                                  Label::Offset pc,
+                                  const Label* label) const VIXL_OVERRIDE {
             Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
             VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
             uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -7424,7 +7417,8 @@ void Assembler::pld(Condition cond, const MemOperand& operand) {
     int32_t offset = operand.GetOffsetImmediate();
     if (IsUsingT32()) {
       // PLD{<c>}{<q>} [PC, #<_plusminus_><imm>] ; T1
-      if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc)) {
+      if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc) &&
+          operand.IsOffset()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf81ff000U | offset_ | (sign << 23));
@@ -7433,7 +7427,8 @@ void Assembler::pld(Condition cond, const MemOperand& operand) {
       }
     } else {
       // PLD{<c>}{<q>} [PC, #<_plusminus_><imm_1>] ; A1
-      if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc)) {
+      if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc) &&
+          operand.IsOffset()) {
         if (cond.Is(al)) {
           uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
           uint32_t offset_ = abs(offset);
@@ -7448,20 +7443,22 @@ void Assembler::pld(Condition cond, const MemOperand& operand) {
     int32_t offset = operand.GetOffsetImmediate();
     if (IsUsingT32()) {
       // PLD{<c>}{<q>} [<Rn>{, #{+}<imm>}] ; T1
-      if ((offset >= 0) && (offset <= 4095) && ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= 0) && (offset <= 4095) && operand.IsOffset() &&
+          ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf890f000U | (rn.GetCode() << 16) | (offset & 0xfff));
         AdvanceIT();
         return;
       }
       // PLD{<c>}{<q>} [<Rn>{, #-<imm_1>}] ; T2
-      if ((-offset >= 0) && (-offset <= 255) && ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((-offset >= 0) && (-offset <= 255) && operand.IsOffset() &&
+          ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf810fc00U | (rn.GetCode() << 16) | (-offset & 0xff));
         AdvanceIT();
         return;
       }
     } else {
       // PLD{<c>}{<q>} [<Rn>{, #{+/-}<imm_2>}] ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsOffset() &&
           ((rn.GetCode() & 0xf) != 0xf)) {
         if (cond.Is(al)) {
           uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
@@ -7480,7 +7477,7 @@ void Assembler::pld(Condition cond, const MemOperand& operand) {
     uint32_t amount = operand.GetShiftAmount();
     if (IsUsingT32()) {
       // PLD{<c>}{<q>} [<Rn>, {+}<Rm>{, LSL #<amount>}] ; T1
-      if (sign.IsPlus() && shift.IsLSL() && (operand.GetAddrMode() == Offset) &&
+      if (sign.IsPlus() && shift.IsLSL() && operand.IsOffset() &&
           ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf810f000U | (rn.GetCode() << 16) | rm.GetCode() |
                    (amount << 4));
@@ -7489,8 +7486,7 @@ void Assembler::pld(Condition cond, const MemOperand& operand) {
       }
     } else {
       // PLD{<c>}{<q>} [<Rn>, {+/-}<Rm>{, <shift> #<amount_1>}] ; A1
-      if (!shift.IsRRX() && shift.IsValidAmount(amount) &&
-          (operand.GetAddrMode() == Offset)) {
+      if (!shift.IsRRX() && shift.IsValidAmount(amount) && operand.IsOffset()) {
         if (cond.Is(al)) {
           uint32_t sign_ = sign.IsPlus() ? 1 : 0;
           uint32_t amount_ = amount % 32;
@@ -7500,7 +7496,7 @@ void Assembler::pld(Condition cond, const MemOperand& operand) {
         }
       }
       // PLD{<c>}{<q>} [<Rn>, {+/-}<Rm>, RRX] ; A1
-      if (shift.IsRRX() && (operand.GetAddrMode() == Offset)) {
+      if (shift.IsRRX() && operand.IsOffset()) {
         if (cond.Is(al)) {
           uint32_t sign_ = sign.IsPlus() ? 1 : 0;
           EmitA32(0xf750f060U | (rn.GetCode() << 16) | rm.GetCode() |
@@ -7521,20 +7517,22 @@ void Assembler::pldw(Condition cond, const MemOperand& operand) {
     int32_t offset = operand.GetOffsetImmediate();
     if (IsUsingT32()) {
       // PLDW{<c>}{<q>} [<Rn>{, #{+}<imm>}] ; T1
-      if ((offset >= 0) && (offset <= 4095) && ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= 0) && (offset <= 4095) && operand.IsOffset() &&
+          ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8b0f000U | (rn.GetCode() << 16) | (offset & 0xfff));
         AdvanceIT();
         return;
       }
       // PLDW{<c>}{<q>} [<Rn>{, #-<imm_1>}] ; T2
-      if ((-offset >= 0) && (-offset <= 255) && ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((-offset >= 0) && (-offset <= 255) && operand.IsOffset() &&
+          ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf830fc00U | (rn.GetCode() << 16) | (-offset & 0xff));
         AdvanceIT();
         return;
       }
     } else {
       // PLDW{<c>}{<q>} [<Rn>{, #{+/-}<imm_2>}] ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsOffset() &&
           ((rn.GetCode() & 0xf) != 0xf)) {
         if (cond.Is(al)) {
           uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
@@ -7553,7 +7551,7 @@ void Assembler::pldw(Condition cond, const MemOperand& operand) {
     uint32_t amount = operand.GetShiftAmount();
     if (IsUsingT32()) {
       // PLDW{<c>}{<q>} [<Rn>, {+}<Rm>{, LSL #<amount>}] ; T1
-      if (sign.IsPlus() && shift.IsLSL() && (operand.GetAddrMode() == Offset) &&
+      if (sign.IsPlus() && shift.IsLSL() && operand.IsOffset() &&
           ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf830f000U | (rn.GetCode() << 16) | rm.GetCode() |
                    (amount << 4));
@@ -7562,8 +7560,7 @@ void Assembler::pldw(Condition cond, const MemOperand& operand) {
       }
     } else {
       // PLDW{<c>}{<q>} [<Rn>, {+/-}<Rm>{, <shift> #<amount_1>}] ; A1
-      if (!shift.IsRRX() && shift.IsValidAmount(amount) &&
-          (operand.GetAddrMode() == Offset)) {
+      if (!shift.IsRRX() && shift.IsValidAmount(amount) && operand.IsOffset()) {
         if (cond.Is(al)) {
           uint32_t sign_ = sign.IsPlus() ? 1 : 0;
           uint32_t amount_ = amount % 32;
@@ -7573,7 +7570,7 @@ void Assembler::pldw(Condition cond, const MemOperand& operand) {
         }
       }
       // PLDW{<c>}{<q>} [<Rn>, {+/-}<Rm>, RRX] ; A1
-      if (shift.IsRRX() && (operand.GetAddrMode() == Offset)) {
+      if (shift.IsRRX() && operand.IsOffset()) {
         if (cond.Is(al)) {
           uint32_t sign_ = sign.IsPlus() ? 1 : 0;
           EmitA32(0xf710f060U | (rn.GetCode() << 16) | rm.GetCode() |
@@ -7594,20 +7591,22 @@ void Assembler::pli(Condition cond, const MemOperand& operand) {
     int32_t offset = operand.GetOffsetImmediate();
     if (IsUsingT32()) {
       // PLI{<c>}{<q>} [<Rn>{, #{+}<imm>}] ; T1
-      if ((offset >= 0) && (offset <= 4095) && ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((offset >= 0) && (offset <= 4095) && operand.IsOffset() &&
+          ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf990f000U | (rn.GetCode() << 16) | (offset & 0xfff));
         AdvanceIT();
         return;
       }
       // PLI{<c>}{<q>} [<Rn>{, #-<imm_1>}] ; T2
-      if ((-offset >= 0) && (-offset <= 255) && ((rn.GetCode() & 0xf) != 0xf)) {
+      if ((-offset >= 0) && (-offset <= 255) && operand.IsOffset() &&
+          ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf910fc00U | (rn.GetCode() << 16) | (-offset & 0xff));
         AdvanceIT();
         return;
       }
     } else {
       // PLI{<c>}{<q>} [<Rn>{, #{+/-}<imm_3>}] ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsOffset() &&
           ((rn.GetCode() & 0xf) != 0xf)) {
         if (cond.Is(al)) {
           uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
@@ -7623,7 +7622,8 @@ void Assembler::pli(Condition cond, const MemOperand& operand) {
     int32_t offset = operand.GetOffsetImmediate();
     if (IsUsingT32()) {
       // PLI{<c>}{<q>} [PC, #<_plusminus_><imm_2>] ; T3
-      if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc)) {
+      if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc) &&
+          operand.IsOffset()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf91ff000U | offset_ | (sign << 23));
@@ -7632,7 +7632,8 @@ void Assembler::pli(Condition cond, const MemOperand& operand) {
       }
     } else {
       // PLI{<c>}{<q>} [PC, #<_plusminus_><imm_3>] ; A1
-      if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc)) {
+      if ((offset >= -4095) && (offset <= 4095) && rn.Is(pc) &&
+          operand.IsOffset()) {
         if (cond.Is(al)) {
           uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
           uint32_t offset_ = abs(offset);
@@ -7650,7 +7651,7 @@ void Assembler::pli(Condition cond, const MemOperand& operand) {
     uint32_t amount = operand.GetShiftAmount();
     if (IsUsingT32()) {
       // PLI{<c>}{<q>} [<Rn>, {+}<Rm>{, LSL #<amount>}] ; T1
-      if (sign.IsPlus() && shift.IsLSL() && (operand.GetAddrMode() == Offset) &&
+      if (sign.IsPlus() && shift.IsLSL() && operand.IsOffset() &&
           ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf910f000U | (rn.GetCode() << 16) | rm.GetCode() |
                    (amount << 4));
@@ -7659,7 +7660,7 @@ void Assembler::pli(Condition cond, const MemOperand& operand) {
       }
     } else {
       // PLI{<c>}{<q>} [<Rn>, {+/-}<Rm>, RRX] ; A1
-      if (shift.IsRRX() && (operand.GetAddrMode() == Offset)) {
+      if (shift.IsRRX() && operand.IsOffset()) {
         if (cond.Is(al)) {
           uint32_t sign_ = sign.IsPlus() ? 1 : 0;
           EmitA32(0xf650f060U | (rn.GetCode() << 16) | rm.GetCode() |
@@ -7668,8 +7669,7 @@ void Assembler::pli(Condition cond, const MemOperand& operand) {
         }
       }
       // PLI{<c>}{<q>} [<Rn>, {+/-}<Rm>{, <shift> #<amount_1>}] ; A1
-      if (!shift.IsRRX() && shift.IsValidAmount(amount) &&
-          (operand.GetAddrMode() == Offset)) {
+      if (!shift.IsRRX() && shift.IsValidAmount(amount) && operand.IsOffset()) {
         if (cond.Is(al)) {
           uint32_t sign_ = sign.IsPlus() ? 1 : 0;
           uint32_t amount_ = amount % 32;
@@ -7698,9 +7698,9 @@ void Assembler::pli(Condition cond, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
           uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -7720,9 +7720,9 @@ void Assembler::pli(Condition cond, Label* label) {
         static class EmitOp : public Label::LabelEmitOperator {
          public:
           EmitOp() : Label::LabelEmitOperator(-4095, 4095) {}
-          uint32_t Encode(uint32_t instr,
-                          Label::Offset pc,
-                          const Label* label) const {
+          virtual uint32_t Encode(uint32_t instr,
+                                  Label::Offset pc,
+                                  const Label* label) const VIXL_OVERRIDE {
             Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
             VIXL_ASSERT((offset >= -4095) && (offset <= 4095));
             uint32_t U = (offset >= 0) && !label->IsMinusZero();
@@ -7833,7 +7833,7 @@ void Assembler::push(Condition cond, EncodingSize size, Register rt) {
     }
   } else {
     // PUSH{<c>}{<q>} <single_register_list> ; A1
-    if (cond.IsNotNever() && ((!rt.IsPC()) || AllowUnpredictable())) {
+    if (cond.IsNotNever() && (!rt.IsPC() || AllowUnpredictable())) {
       EmitA32(0x052d0004U | (cond.GetCondition() << 28) | (rt.GetCode() << 12));
       return;
     }
@@ -9942,16 +9942,15 @@ void Assembler::stl(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STL{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00fafU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // STL{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x0180fc90U | (cond.GetCondition() << 28) | rt.GetCode() |
                 (rn.GetCode() << 16));
         return;
@@ -9968,16 +9967,15 @@ void Assembler::stlb(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STLB{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00f8fU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // STLB{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01c0fc90U | (cond.GetCondition() << 28) | rt.GetCode() |
                 (rn.GetCode() << 16));
         return;
@@ -9997,8 +9995,7 @@ void Assembler::stlex(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STLEX{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00fe0U | rd.GetCode() | (rt.GetCode() << 12) |
                    (rn.GetCode() << 16));
         AdvanceIT();
@@ -10006,8 +10003,8 @@ void Assembler::stlex(Condition cond,
       }
     } else {
       // STLEX{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01800e90U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rt.GetCode() | (rn.GetCode() << 16));
         return;
@@ -10027,8 +10024,7 @@ void Assembler::stlexb(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STLEXB{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00fc0U | rd.GetCode() | (rt.GetCode() << 12) |
                    (rn.GetCode() << 16));
         AdvanceIT();
@@ -10036,8 +10032,8 @@ void Assembler::stlexb(Condition cond,
       }
     } else {
       // STLEXB{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01c00e90U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rt.GetCode() | (rn.GetCode() << 16));
         return;
@@ -10058,8 +10054,7 @@ void Assembler::stlexd(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STLEXD{<c>}{<q>} <Rd>, <Rt>, <Rt2>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c000f0U | rd.GetCode() | (rt.GetCode() << 12) |
                    (rt2.GetCode() << 8) | (rn.GetCode() << 16));
         AdvanceIT();
@@ -10068,7 +10063,7 @@ void Assembler::stlexd(Condition cond,
     } else {
       // STLEXD{<c>}{<q>} <Rd>, <Rt>, <Rt2>, [<Rn>] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
+          operand.IsOffset() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0) && !rn.IsPC()) ||
            AllowUnpredictable())) {
         EmitA32(0x01a00e90U | (cond.GetCondition() << 28) |
@@ -10090,8 +10085,7 @@ void Assembler::stlexh(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STLEXH{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00fd0U | rd.GetCode() | (rt.GetCode() << 12) |
                    (rn.GetCode() << 16));
         AdvanceIT();
@@ -10099,8 +10093,8 @@ void Assembler::stlexh(Condition cond,
       }
     } else {
       // STLEXH{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01e00e90U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rt.GetCode() | (rn.GetCode() << 16));
         return;
@@ -10117,16 +10111,15 @@ void Assembler::stlh(Condition cond, Register rt, const MemOperand& operand) {
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STLH{<c>}{<q>} <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00f9fU | (rt.GetCode() << 12) | (rn.GetCode() << 16));
         AdvanceIT();
         return;
       }
     } else {
       // STLH{<c>}{<q>} <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01e0fc90U | (cond.GetCondition() << 28) | rt.GetCode() |
                 (rn.GetCode() << 16));
         return;
@@ -10368,8 +10361,7 @@ void Assembler::str(Condition cond,
     if (IsUsingT32()) {
       // STR{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm>}] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && (offset >= 0) &&
-          (offset <= 124) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == Offset)) {
+          (offset <= 124) && ((offset % 4) == 0) && operand.IsOffset()) {
         int32_t offset_ = offset >> 2;
         EmitT32_16(0x6000 | rt.GetCode() | (rn.GetCode() << 3) |
                    ((offset_ & 0x1f) << 6));
@@ -10378,8 +10370,7 @@ void Assembler::str(Condition cond,
       }
       // STR{<c>}{<q>} <Rt>, [SP{, #{+}<imm>}] ; T2
       if (!size.IsWide() && rt.IsLow() && (offset >= 0) && (offset <= 1020) &&
-          ((offset % 4) == 0) && rn.Is(sp) &&
-          (operand.GetAddrMode() == Offset)) {
+          ((offset % 4) == 0) && rn.Is(sp) && operand.IsOffset()) {
         int32_t offset_ = offset >> 2;
         EmitT32_16(0x9000 | (rt.GetCode() << 8) | (offset_ & 0xff));
         AdvanceIT();
@@ -10387,7 +10378,7 @@ void Assembler::str(Condition cond,
       }
       // STR{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm_1>}] ; T3
       if (!size.IsNarrow() && (offset >= 0) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8c00000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset & 0xfff));
         AdvanceIT();
@@ -10395,7 +10386,7 @@ void Assembler::str(Condition cond,
       }
       // STR{<c>}{<q>} <Rt>, [<Rn>{, #-<imm_2>}] ; T4
       if (!size.IsNarrow() && (-offset >= 0) && (-offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8400c00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (-offset & 0xff));
         AdvanceIT();
@@ -10403,8 +10394,7 @@ void Assembler::str(Condition cond,
       }
       // STR{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_2> ; T4
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8400900U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -10414,8 +10404,7 @@ void Assembler::str(Condition cond,
       }
       // STR{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}]! ; T4
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8400d00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -10425,8 +10414,8 @@ void Assembler::str(Condition cond,
       }
     } else {
       // STR{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}] ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsOffset() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x05000000U | (cond.GetCondition() << 28) |
@@ -10435,8 +10424,8 @@ void Assembler::str(Condition cond,
         return;
       }
       // STR{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_3> ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever()) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsPostIndex() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x04000000U | (cond.GetCondition() << 28) |
@@ -10445,8 +10434,8 @@ void Assembler::str(Condition cond,
         return;
       }
       // STR{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}]! ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever()) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsPreIndex() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x05200000U | (cond.GetCondition() << 28) |
@@ -10463,7 +10452,7 @@ void Assembler::str(Condition cond,
     if (IsUsingT32()) {
       // STR{<c>}{<q>} <Rt>, [<Rn>, #{+}<Rm>] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && rm.IsLow() &&
-          sign.IsPlus() && (operand.GetAddrMode() == Offset)) {
+          sign.IsPlus() && operand.IsOffset()) {
         EmitT32_16(0x5000 | rt.GetCode() | (rn.GetCode() << 3) |
                    (rm.GetCode() << 6));
         AdvanceIT();
@@ -10480,7 +10469,7 @@ void Assembler::str(Condition cond,
     if (IsUsingT32()) {
       // STR{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>{, LSL #<imm>}] ; T2
       if (!size.IsNarrow() && sign.IsPlus() && shift.IsLSL() && (amount <= 3) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8400000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    rm.GetCode() | (amount << 4));
         AdvanceIT();
@@ -10488,8 +10477,7 @@ void Assembler::str(Condition cond,
       }
     } else {
       // STR{<c>}{<q>} <Rt>, [<Rn>, {+/-}<Rm>{, <shift>}] ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever()) {
+      if (operand.IsShiftValid() && operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
         uint32_t imm_and_type_ = (((amount % 32) << 2) | shift_);
@@ -10499,7 +10487,7 @@ void Assembler::str(Condition cond,
         return;
       }
       // STR{<c>}{<q>} <Rt>, [<Rn>], {+/-}<Rm>{, <shift>} ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == PostIndex) &&
+      if (operand.IsShiftValid() && operand.IsPostIndex() &&
           cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
@@ -10510,8 +10498,7 @@ void Assembler::str(Condition cond,
         return;
       }
       // STR{<c>}{<q>} <Rt>, [<Rn>, {+/-}<Rm>{, <shift>}]! ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == PreIndex) &&
-          cond.IsNotNever()) {
+      if (operand.IsShiftValid() && operand.IsPreIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
         uint32_t imm_and_type_ = (((amount % 32) << 2) | shift_);
@@ -10537,7 +10524,7 @@ void Assembler::strb(Condition cond,
     if (IsUsingT32()) {
       // STRB{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm>}] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && (offset >= 0) &&
-          (offset <= 31) && (operand.GetAddrMode() == Offset)) {
+          (offset <= 31) && operand.IsOffset()) {
         EmitT32_16(0x7000 | rt.GetCode() | (rn.GetCode() << 3) |
                    ((offset & 0x1f) << 6));
         AdvanceIT();
@@ -10545,7 +10532,7 @@ void Assembler::strb(Condition cond,
       }
       // STRB{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm_1>}] ; T2
       if (!size.IsNarrow() && (offset >= 0) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8800000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset & 0xfff));
         AdvanceIT();
@@ -10553,7 +10540,7 @@ void Assembler::strb(Condition cond,
       }
       // STRB{<c>}{<q>} <Rt>, [<Rn>{, #-<imm_2>}] ; T3
       if (!size.IsNarrow() && (-offset >= 0) && (-offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8000c00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (-offset & 0xff));
         AdvanceIT();
@@ -10561,8 +10548,7 @@ void Assembler::strb(Condition cond,
       }
       // STRB{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_2> ; T3
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8000900U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -10572,8 +10558,7 @@ void Assembler::strb(Condition cond,
       }
       // STRB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}]! ; T3
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8000d00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -10583,8 +10568,8 @@ void Assembler::strb(Condition cond,
       }
     } else {
       // STRB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}] ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsOffset() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x05400000U | (cond.GetCondition() << 28) |
@@ -10593,8 +10578,8 @@ void Assembler::strb(Condition cond,
         return;
       }
       // STRB{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_3> ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever()) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsPostIndex() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x04400000U | (cond.GetCondition() << 28) |
@@ -10603,8 +10588,8 @@ void Assembler::strb(Condition cond,
         return;
       }
       // STRB{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}]! ; A1
-      if ((offset >= -4095) && (offset <= 4095) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever()) {
+      if ((offset >= -4095) && (offset <= 4095) && operand.IsPreIndex() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x05600000U | (cond.GetCondition() << 28) |
@@ -10621,7 +10606,7 @@ void Assembler::strb(Condition cond,
     if (IsUsingT32()) {
       // STRB{<c>}{<q>} <Rt>, [<Rn>, #{+}<Rm>] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && rm.IsLow() &&
-          sign.IsPlus() && (operand.GetAddrMode() == Offset)) {
+          sign.IsPlus() && operand.IsOffset()) {
         EmitT32_16(0x5400 | rt.GetCode() | (rn.GetCode() << 3) |
                    (rm.GetCode() << 6));
         AdvanceIT();
@@ -10638,7 +10623,7 @@ void Assembler::strb(Condition cond,
     if (IsUsingT32()) {
       // STRB{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>{, LSL #<imm>}] ; T2
       if (!size.IsNarrow() && sign.IsPlus() && shift.IsLSL() && (amount <= 3) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8000000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    rm.GetCode() | (amount << 4));
         AdvanceIT();
@@ -10646,8 +10631,7 @@ void Assembler::strb(Condition cond,
       }
     } else {
       // STRB{<c>}{<q>} <Rt>, [<Rn>, {+/-}<Rm>{, <shift>}] ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever()) {
+      if (operand.IsShiftValid() && operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
         uint32_t imm_and_type_ = (((amount % 32) << 2) | shift_);
@@ -10657,7 +10641,7 @@ void Assembler::strb(Condition cond,
         return;
       }
       // STRB{<c>}{<q>} <Rt>, [<Rn>], {+/-}<Rm>{, <shift>} ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == PostIndex) &&
+      if (operand.IsShiftValid() && operand.IsPostIndex() &&
           cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
@@ -10668,8 +10652,7 @@ void Assembler::strb(Condition cond,
         return;
       }
       // STRB{<c>}{<q>} <Rt>, [<Rn>, {+/-}<Rm>{, <shift>}]! ; A1
-      if (operand.IsShiftValid() && (operand.GetAddrMode() == PreIndex) &&
-          cond.IsNotNever()) {
+      if (operand.IsShiftValid() && operand.IsPreIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         uint32_t shift_ = TypeEncodingValue(shift);
         uint32_t imm_and_type_ = (((amount % 32) << 2) | shift_);
@@ -10695,7 +10678,7 @@ void Assembler::strd(Condition cond,
     if (IsUsingT32()) {
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>{, #{+/-}<imm>}] ; T1
       if ((offset >= -1020) && (offset <= 1020) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xe9400000U | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
@@ -10705,8 +10688,7 @@ void Assembler::strd(Condition cond,
       }
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>], #{+/-}<imm> ; T1
       if ((offset >= -1020) && (offset <= 1020) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xe8600000U | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
@@ -10716,8 +10698,7 @@ void Assembler::strd(Condition cond,
       }
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>{, #{+/-}<imm>}]! ; T1
       if ((offset >= -1020) && (offset <= 1020) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xe9600000U | (rt.GetCode() << 12) | (rt2.GetCode() << 8) |
@@ -10728,8 +10709,8 @@ void Assembler::strd(Condition cond,
     } else {
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>{, #{+/-}<imm_1>}] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
+          (offset >= -255) && (offset <= 255) && operand.IsOffset() &&
+          cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
@@ -10740,8 +10721,8 @@ void Assembler::strd(Condition cond,
       }
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>], #{+/-}<imm_1> ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
+          (offset >= -255) && (offset <= 255) && operand.IsPostIndex() &&
+          cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
@@ -10752,8 +10733,8 @@ void Assembler::strd(Condition cond,
       }
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>{, #{+/-}<imm_1>}]! ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
+          (offset >= -255) && (offset <= 255) && operand.IsPreIndex() &&
+          cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
@@ -10771,7 +10752,7 @@ void Assembler::strd(Condition cond,
     if (IsUsingA32()) {
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>, #{+/-}<Rm>] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
+          operand.IsOffset() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x010000f0U | (cond.GetCondition() << 28) |
@@ -10781,7 +10762,7 @@ void Assembler::strd(Condition cond,
       }
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>], #{+/-}<Rm> ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever() &&
+          operand.IsPostIndex() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x000000f0U | (cond.GetCondition() << 28) |
@@ -10791,7 +10772,7 @@ void Assembler::strd(Condition cond,
       }
       // STRD{<c>}{<q>} <Rt>, <Rt2>, [<Rn>, #{+/-}<Rm>]! ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever() &&
+          operand.IsPreIndex() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0)) || AllowUnpredictable())) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x012000f0U | (cond.GetCondition() << 28) |
@@ -10816,7 +10797,7 @@ void Assembler::strex(Condition cond,
     if (IsUsingT32()) {
       // STREX{<c>}{<q>} <Rd>, <Rt>, [<Rn>{, #<imm>}] ; T1
       if ((offset >= 0) && (offset <= 1020) && ((offset % 4) == 0) &&
-          (operand.GetAddrMode() == Offset)) {
+          operand.IsOffset()) {
         int32_t offset_ = offset >> 2;
         EmitT32_32(0xe8400000U | (rd.GetCode() << 8) | (rt.GetCode() << 12) |
                    (rn.GetCode() << 16) | (offset_ & 0xff));
@@ -10825,8 +10806,7 @@ void Assembler::strex(Condition cond,
       }
     } else {
       // STREX{<c>}{<q>} <Rd>, <Rt>, [<Rn>{, #<imm_1>}] ; A1
-      if ((offset == 0) && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever()) {
+      if ((offset == 0) && operand.IsOffset() && cond.IsNotNever()) {
         EmitA32(0x01800f90U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rt.GetCode() | (rn.GetCode() << 16));
         return;
@@ -10846,8 +10826,7 @@ void Assembler::strexb(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STREXB{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00f40U | rd.GetCode() | (rt.GetCode() << 12) |
                    (rn.GetCode() << 16));
         AdvanceIT();
@@ -10855,8 +10834,8 @@ void Assembler::strexb(Condition cond,
       }
     } else {
       // STREXB{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01c00f90U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rt.GetCode() | (rn.GetCode() << 16));
         return;
@@ -10877,8 +10856,7 @@ void Assembler::strexd(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STREXD{<c>}{<q>} <Rd>, <Rt>, <Rt2>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00070U | rd.GetCode() | (rt.GetCode() << 12) |
                    (rt2.GetCode() << 8) | (rn.GetCode() << 16));
         AdvanceIT();
@@ -10887,7 +10865,7 @@ void Assembler::strexd(Condition cond,
     } else {
       // STREXD{<c>}{<q>} <Rd>, <Rt>, <Rt2>, [<Rn>] ; A1
       if ((((rt.GetCode() + 1) % kNumberOfRegisters) == rt2.GetCode()) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
+          operand.IsOffset() && cond.IsNotNever() &&
           ((!rt.IsLR() && ((rt.GetCode() & 1) == 0) && !rn.IsPC()) ||
            AllowUnpredictable())) {
         EmitA32(0x01a00f90U | (cond.GetCondition() << 28) |
@@ -10909,8 +10887,7 @@ void Assembler::strexh(Condition cond,
     Register rn = operand.GetBaseRegister();
     if (IsUsingT32()) {
       // STREXH{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; T1
-      if ((operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         EmitT32_32(0xe8c00f50U | rd.GetCode() | (rt.GetCode() << 12) |
                    (rn.GetCode() << 16));
         AdvanceIT();
@@ -10918,8 +10895,8 @@ void Assembler::strexh(Condition cond,
       }
     } else {
       // STREXH{<c>}{<q>} <Rd>, <Rt>, [<Rn>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+      if (operand.IsOffset() && cond.IsNotNever() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         EmitA32(0x01e00f90U | (cond.GetCondition() << 28) |
                 (rd.GetCode() << 12) | rt.GetCode() | (rn.GetCode() << 16));
         return;
@@ -10941,8 +10918,7 @@ void Assembler::strh(Condition cond,
     if (IsUsingT32()) {
       // STRH{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm>}] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && (offset >= 0) &&
-          (offset <= 62) && ((offset % 2) == 0) &&
-          (operand.GetAddrMode() == Offset)) {
+          (offset <= 62) && ((offset % 2) == 0) && operand.IsOffset()) {
         int32_t offset_ = offset >> 1;
         EmitT32_16(0x8000 | rt.GetCode() | (rn.GetCode() << 3) |
                    ((offset_ & 0x1f) << 6));
@@ -10951,7 +10927,7 @@ void Assembler::strh(Condition cond,
       }
       // STRH{<c>}{<q>} <Rt>, [<Rn>{, #{+}<imm_1>}] ; T2
       if (!size.IsNarrow() && (offset >= 0) && (offset <= 4095) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8a00000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (offset & 0xfff));
         AdvanceIT();
@@ -10959,7 +10935,7 @@ void Assembler::strh(Condition cond,
       }
       // STRH{<c>}{<q>} <Rt>, [<Rn>{, #-<imm_2>}] ; T3
       if (!size.IsNarrow() && (-offset >= 0) && (-offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8200c00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    (-offset & 0xff));
         AdvanceIT();
@@ -10967,8 +10943,7 @@ void Assembler::strh(Condition cond,
       }
       // STRH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_2> ; T3
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPostIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8200900U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -10978,8 +10953,7 @@ void Assembler::strh(Condition cond,
       }
       // STRH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_2>}]! ; T3
       if (!size.IsNarrow() && (offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsPreIndex() && ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitT32_32(0xf8200d00U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
@@ -10989,8 +10963,8 @@ void Assembler::strh(Condition cond,
       }
     } else {
       // STRH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}] ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsOffset() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x014000b0U | (cond.GetCondition() << 28) |
@@ -10999,8 +10973,8 @@ void Assembler::strh(Condition cond,
         return;
       }
       // STRH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<imm_3> ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PostIndex) && cond.IsNotNever()) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsPostIndex() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x004000b0U | (cond.GetCondition() << 28) |
@@ -11009,8 +10983,8 @@ void Assembler::strh(Condition cond,
         return;
       }
       // STRH{<c>}{<q>} <Rt>, [<Rn>{, #{+/-}<imm_3>}]! ; A1
-      if ((offset >= -255) && (offset <= 255) &&
-          (operand.GetAddrMode() == PreIndex) && cond.IsNotNever()) {
+      if ((offset >= -255) && (offset <= 255) && operand.IsPreIndex() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset);
         EmitA32(0x016000b0U | (cond.GetCondition() << 28) |
@@ -11027,7 +11001,7 @@ void Assembler::strh(Condition cond,
     if (IsUsingT32()) {
       // STRH{<c>}{<q>} <Rt>, [<Rn>, #{+}<Rm>] ; T1
       if (!size.IsWide() && rt.IsLow() && rn.IsLow() && rm.IsLow() &&
-          sign.IsPlus() && (operand.GetAddrMode() == Offset)) {
+          sign.IsPlus() && operand.IsOffset()) {
         EmitT32_16(0x5200 | rt.GetCode() | (rn.GetCode() << 3) |
                    (rm.GetCode() << 6));
         AdvanceIT();
@@ -11035,7 +11009,7 @@ void Assembler::strh(Condition cond,
       }
     } else {
       // STRH{<c>}{<q>} <Rt>, [<Rn>, #{+/-}<Rm>] ; A1
-      if ((operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+      if (operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x010000b0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -11043,7 +11017,7 @@ void Assembler::strh(Condition cond,
         return;
       }
       // STRH{<c>}{<q>} <Rt>, [<Rn>], #{+/-}<Rm> ; A1
-      if ((operand.GetAddrMode() == PostIndex) && cond.IsNotNever()) {
+      if (operand.IsPostIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x000000b0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -11051,7 +11025,7 @@ void Assembler::strh(Condition cond,
         return;
       }
       // STRH{<c>}{<q>} <Rt>, [<Rn>, #{+/-}<Rm>]! ; A1
-      if ((operand.GetAddrMode() == PreIndex) && cond.IsNotNever()) {
+      if (operand.IsPreIndex() && cond.IsNotNever()) {
         uint32_t sign_ = sign.IsPlus() ? 1 : 0;
         EmitA32(0x012000b0U | (cond.GetCondition() << 28) |
                 (rt.GetCode() << 12) | (rn.GetCode() << 16) | rm.GetCode() |
@@ -11069,7 +11043,7 @@ void Assembler::strh(Condition cond,
     if (IsUsingT32()) {
       // STRH{<c>}{<q>} <Rt>, [<Rn>, {+}<Rm>{, LSL #<imm>}] ; T2
       if (!size.IsNarrow() && sign.IsPlus() && shift.IsLSL() && (amount <= 3) &&
-          (operand.GetAddrMode() == Offset) && ((rn.GetCode() & 0xf) != 0xf)) {
+          operand.IsOffset() && ((rn.GetCode() & 0xf) != 0xf)) {
         EmitT32_32(0xf8200000U | (rt.GetCode() << 12) | (rn.GetCode() << 16) |
                    rm.GetCode() | (amount << 4));
         AdvanceIT();
@@ -11706,7 +11680,7 @@ void Assembler::tbb(Condition cond, Register rn, Register rm) {
   if (IsUsingT32()) {
     // TBB{<c>}{<q>} [<Rn>, <Rm>] ; T1
     if (OutsideITBlockAndAlOrLast(cond) &&
-        ((!rm.IsPC()) || AllowUnpredictable())) {
+        (!rm.IsPC() || AllowUnpredictable())) {
       EmitT32_32(0xe8d0f000U | (rn.GetCode() << 16) | rm.GetCode());
       AdvanceIT();
       return;
@@ -11721,7 +11695,7 @@ void Assembler::tbh(Condition cond, Register rn, Register rm) {
   if (IsUsingT32()) {
     // TBH{<c>}{<q>} [<Rn>, <Rm>, LSL #1] ; T1
     if (OutsideITBlockAndAlOrLast(cond) &&
-        ((!rm.IsPC()) || AllowUnpredictable())) {
+        (!rm.IsPC() || AllowUnpredictable())) {
       EmitT32_32(0xe8d0f010U | (rn.GetCode() << 16) | rm.GetCode());
       AdvanceIT();
       return;
@@ -16848,8 +16822,8 @@ void Assembler::vld1(Condition cond,
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; T1
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 4) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -16880,8 +16854,8 @@ void Assembler::vld1(Condition cond,
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; T1
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 4) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -16912,8 +16886,8 @@ void Assembler::vld1(Condition cond,
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; T1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferAllLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 2) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.GetLength() - 1;
@@ -16928,8 +16902,8 @@ void Assembler::vld1(Condition cond,
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; T1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferAllLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 2) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.GetLength() - 1;
@@ -16943,8 +16917,8 @@ void Assembler::vld1(Condition cond,
       }
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; T1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferOneLane() &&
-          (nreglist.GetLength() == 1) && (operand.GetAddrMode() == Offset) &&
-          encoded_align_3.IsValid() && ((!rn.IsPC()) || AllowUnpredictable())) {
+          (nreglist.GetLength() == 1) && operand.IsOffset() &&
+          encoded_align_3.IsValid() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a0000fU | (encoded_dt_2.GetEncodingValue() << 10) |
@@ -16956,8 +16930,8 @@ void Assembler::vld1(Condition cond,
       }
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; T1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferOneLane() &&
-          (nreglist.GetLength() == 1) && (operand.GetAddrMode() == PostIndex) &&
-          encoded_align_3.IsValid() && ((!rn.IsPC()) || AllowUnpredictable())) {
+          (nreglist.GetLength() == 1) && operand.IsPostIndex() &&
+          encoded_align_3.IsValid() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a0000dU | (encoded_dt_2.GetEncodingValue() << 10) |
@@ -16971,8 +16945,8 @@ void Assembler::vld1(Condition cond,
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; A1
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 4) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -17002,8 +16976,8 @@ void Assembler::vld1(Condition cond,
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; A1
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 4) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -17033,8 +17007,8 @@ void Assembler::vld1(Condition cond,
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; A1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferAllLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 2) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.GetLength() - 1;
@@ -17048,8 +17022,8 @@ void Assembler::vld1(Condition cond,
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; A1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferAllLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 2) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.GetLength() - 1;
@@ -17062,8 +17036,8 @@ void Assembler::vld1(Condition cond,
       }
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; A1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferOneLane() &&
-          (nreglist.GetLength() == 1) && (operand.GetAddrMode() == Offset) &&
-          encoded_align_3.IsValid() && ((!rn.IsPC()) || AllowUnpredictable())) {
+          (nreglist.GetLength() == 1) && operand.IsOffset() &&
+          encoded_align_3.IsValid() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a0000fU | (encoded_dt_2.GetEncodingValue() << 10) |
@@ -17074,8 +17048,8 @@ void Assembler::vld1(Condition cond,
       }
       // VLD1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; A1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferOneLane() &&
-          (nreglist.GetLength() == 1) && (operand.GetAddrMode() == PostIndex) &&
-          encoded_align_3.IsValid() && ((!rn.IsPC()) || AllowUnpredictable())) {
+          (nreglist.GetLength() == 1) && operand.IsPostIndex() &&
+          encoded_align_3.IsValid() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a0000dU | (encoded_dt_2.GetEncodingValue() << 10) |
@@ -17235,8 +17209,8 @@ void Assembler::vld2(Condition cond,
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -17262,8 +17236,8 @@ void Assembler::vld2(Condition cond,
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -17288,8 +17262,8 @@ void Assembler::vld2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17305,8 +17279,8 @@ void Assembler::vld2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17322,8 +17296,8 @@ void Assembler::vld2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_3.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_3.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a0010fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -17337,8 +17311,8 @@ void Assembler::vld2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_3.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_3.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a0010dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -17354,8 +17328,8 @@ void Assembler::vld2(Condition cond,
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -17380,8 +17354,8 @@ void Assembler::vld2(Condition cond,
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -17405,8 +17379,8 @@ void Assembler::vld2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17421,8 +17395,8 @@ void Assembler::vld2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17437,8 +17411,8 @@ void Assembler::vld2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_3.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_3.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a0010fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -17451,8 +17425,8 @@ void Assembler::vld2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_3.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_3.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a0010dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -17604,8 +17578,8 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x4 : 0x5;
@@ -17621,8 +17595,8 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x4 : 0x5;
@@ -17639,8 +17613,8 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x4 : 0x5;
@@ -17655,8 +17629,8 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x4 : 0x5;
@@ -17728,8 +17702,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17744,8 +17717,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPreIndex() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17760,8 +17732,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a0020fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -17775,8 +17746,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPreIndex() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a0020dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -17791,8 +17761,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17806,8 +17775,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPreIndex() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17821,8 +17789,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a0020fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -17835,8 +17802,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPreIndex() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a0020dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -17858,7 +17824,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          sign.IsPlus() && (operand.GetAddrMode() == PostIndex)) {
+          sign.IsPlus() && operand.IsPostIndex()) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17873,7 +17839,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          sign.IsPlus() && (operand.GetAddrMode() == PostIndex)) {
+          sign.IsPlus() && operand.IsPostIndex()) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a00200U | (encoded_dt.GetEncodingValue() << 10) |
@@ -17889,7 +17855,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          sign.IsPlus() && (operand.GetAddrMode() == PostIndex)) {
+          sign.IsPlus() && operand.IsPostIndex()) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17903,7 +17869,7 @@ void Assembler::vld3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          sign.IsPlus() && (operand.GetAddrMode() == PostIndex)) {
+          sign.IsPlus() && operand.IsPostIndex()) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a00200U | (encoded_dt.GetEncodingValue() << 10) |
@@ -17936,8 +17902,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17953,8 +17919,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17970,8 +17936,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt_2.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -17987,8 +17953,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt_2.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -18004,8 +17970,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_3.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_3.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a0030fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -18019,8 +17985,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_3.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_3.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9a0030dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -18035,8 +18001,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -18051,8 +18017,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -18067,8 +18033,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt_2.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -18083,8 +18049,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt_2.IsValid() && nreglist.IsTransferAllLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -18099,8 +18065,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_3.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_3.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a0030fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -18113,8 +18079,8 @@ void Assembler::vld4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_3.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_3.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4a0030dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -18241,7 +18207,7 @@ void Assembler::vldm(Condition cond,
   USE(dt);
   if (IsUsingT32()) {
     // VLDM{<c>}{<q>}{.<size>} <Rn>{!}, <dreglist> ; T1
-    if ((((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+    if (((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitT32_32(0xec900b00U | (rn.GetCode() << 16) |
@@ -18253,7 +18219,7 @@ void Assembler::vldm(Condition cond,
   } else {
     // VLDM{<c>}{<q>}{.<size>} <Rn>{!}, <dreglist> ; A1
     if (cond.IsNotNever() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitA32(0x0c900b00U | (cond.GetCondition() << 28) | (rn.GetCode() << 16) |
@@ -18307,7 +18273,7 @@ void Assembler::vldmdb(Condition cond,
   if (IsUsingT32()) {
     // VLDMDB{<c>}{<q>}{.<size>} <Rn>!, <dreglist> ; T1
     if (write_back.DoesWriteBack() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitT32_32(0xed300b00U | (rn.GetCode() << 16) | dreg.Encode(22, 12) |
@@ -18318,7 +18284,7 @@ void Assembler::vldmdb(Condition cond,
   } else {
     // VLDMDB{<c>}{<q>}{.<size>} <Rn>!, <dreglist> ; A1
     if (write_back.DoesWriteBack() && cond.IsNotNever() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitA32(0x0d300b00U | (cond.GetCondition() << 28) | (rn.GetCode() << 16) |
@@ -18370,7 +18336,7 @@ void Assembler::vldmia(Condition cond,
   USE(dt);
   if (IsUsingT32()) {
     // VLDMIA{<c>}{<q>}{.<size>} <Rn>{!}, <dreglist> ; T1
-    if ((((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+    if (((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitT32_32(0xec900b00U | (rn.GetCode() << 16) |
@@ -18382,7 +18348,7 @@ void Assembler::vldmia(Condition cond,
   } else {
     // VLDMIA{<c>}{<q>}{.<size>} <Rn>{!}, <dreglist> ; A1
     if (cond.IsNotNever() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitA32(0x0c900b00U | (cond.GetCondition() << 28) | (rn.GetCode() << 16) |
@@ -18442,9 +18408,9 @@ void Assembler::vldr(Condition cond, DataType dt, DRegister rd, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-1020, 1020) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -1020) && (offset <= 1020) &&
                       ((offset & 0x3) == 0));
@@ -18468,9 +18434,9 @@ void Assembler::vldr(Condition cond, DataType dt, DRegister rd, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-1020, 1020) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -1020) && (offset <= 1020) &&
                       ((offset & 0x3) == 0));
@@ -18502,8 +18468,7 @@ void Assembler::vldr(Condition cond,
     if (IsUsingT32()) {
       // VLDR{<c>}{<q>}{.64} <Dd>, [PC, #<_plusminus_><imm>] ; T1
       if (dt.IsNoneOr(Untyped64) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset)) {
+          ((offset % 4) == 0) && rn.Is(pc) && operand.IsOffset()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xed1f0b00U | rd.Encode(22, 12) | offset_ | (sign << 23));
@@ -18512,7 +18477,7 @@ void Assembler::vldr(Condition cond,
       }
       // VLDR{<c>}{<q>}{.64} <Dd>, [<Rn>{, #{+/-}<imm>}] ; T1
       if (dt.IsNoneOr(Untyped64) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && (operand.GetAddrMode() == Offset) &&
+          ((offset % 4) == 0) && operand.IsOffset() &&
           ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
@@ -18524,8 +18489,8 @@ void Assembler::vldr(Condition cond,
     } else {
       // VLDR{<c>}{<q>}{.64} <Dd>, [PC, #<_plusminus_><imm>] ; A1
       if (dt.IsNoneOr(Untyped64) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+          ((offset % 4) == 0) && rn.Is(pc) && operand.IsOffset() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitA32(0x0d1f0b00U | (cond.GetCondition() << 28) | rd.Encode(22, 12) |
@@ -18534,8 +18499,8 @@ void Assembler::vldr(Condition cond,
       }
       // VLDR{<c>}{<q>}{.64} <Dd>, [<Rn>{, #{+/-}<imm>}] ; A1
       if (dt.IsNoneOr(Untyped64) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
+          ((offset % 4) == 0) && operand.IsOffset() && cond.IsNotNever() &&
+          ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitA32(0x0d100b00U | (cond.GetCondition() << 28) | rd.Encode(22, 12) |
@@ -18564,9 +18529,9 @@ void Assembler::vldr(Condition cond, DataType dt, SRegister rd, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-1020, 1020) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -1020) && (offset <= 1020) &&
                       ((offset & 0x3) == 0));
@@ -18590,9 +18555,9 @@ void Assembler::vldr(Condition cond, DataType dt, SRegister rd, Label* label) {
       static class EmitOp : public Label::LabelEmitOperator {
        public:
         EmitOp() : Label::LabelEmitOperator(-1020, 1020) {}
-        uint32_t Encode(uint32_t instr,
-                        Label::Offset pc,
-                        const Label* label) const {
+        virtual uint32_t Encode(uint32_t instr,
+                                Label::Offset pc,
+                                const Label* label) const VIXL_OVERRIDE {
           Label::Offset offset = label->GetLocation() - AlignDown(pc, 4);
           VIXL_ASSERT((offset >= -1020) && (offset <= 1020) &&
                       ((offset & 0x3) == 0));
@@ -18624,8 +18589,7 @@ void Assembler::vldr(Condition cond,
     if (IsUsingT32()) {
       // VLDR{<c>}{<q>}{.32} <Sd>, [PC, #<_plusminus_><imm>] ; T2
       if (dt.IsNoneOr(Untyped32) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset)) {
+          ((offset % 4) == 0) && rn.Is(pc) && operand.IsOffset()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xed1f0a00U | rd.Encode(22, 12) | offset_ | (sign << 23));
@@ -18634,7 +18598,7 @@ void Assembler::vldr(Condition cond,
       }
       // VLDR{<c>}{<q>}{.32} <Sd>, [<Rn>{, #{+/-}<imm>}] ; T2
       if (dt.IsNoneOr(Untyped32) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && (operand.GetAddrMode() == Offset) &&
+          ((offset % 4) == 0) && operand.IsOffset() &&
           ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
@@ -18646,8 +18610,8 @@ void Assembler::vldr(Condition cond,
     } else {
       // VLDR{<c>}{<q>}{.32} <Sd>, [PC, #<_plusminus_><imm>] ; A2
       if (dt.IsNoneOr(Untyped32) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && rn.Is(pc) &&
-          (operand.GetAddrMode() == Offset) && cond.IsNotNever()) {
+          ((offset % 4) == 0) && rn.Is(pc) && operand.IsOffset() &&
+          cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitA32(0x0d1f0a00U | (cond.GetCondition() << 28) | rd.Encode(22, 12) |
@@ -18656,8 +18620,8 @@ void Assembler::vldr(Condition cond,
       }
       // VLDR{<c>}{<q>}{.32} <Sd>, [<Rn>{, #{+/-}<imm>}] ; A2
       if (dt.IsNoneOr(Untyped32) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever() && ((rn.GetCode() & 0xf) != 0xf)) {
+          ((offset % 4) == 0) && operand.IsOffset() && cond.IsNotNever() &&
+          ((rn.GetCode() & 0xf) != 0xf)) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitA32(0x0d100a00U | (cond.GetCondition() << 28) | rd.Encode(22, 12) |
@@ -21181,7 +21145,7 @@ void Assembler::vpop(Condition cond, DataType dt, DRegisterList dreglist) {
   USE(dt);
   if (IsUsingT32()) {
     // VPOP{<c>}{<q>}{.<size>} <dreglist> ; T1
-    if ((((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+    if (((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitT32_32(0xecbd0b00U | dreg.Encode(22, 12) | (len & 0xff));
@@ -21191,7 +21155,7 @@ void Assembler::vpop(Condition cond, DataType dt, DRegisterList dreglist) {
   } else {
     // VPOP{<c>}{<q>}{.<size>} <dreglist> ; A1
     if (cond.IsNotNever() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitA32(0x0cbd0b00U | (cond.GetCondition() << 28) | dreg.Encode(22, 12) |
@@ -21232,7 +21196,7 @@ void Assembler::vpush(Condition cond, DataType dt, DRegisterList dreglist) {
   USE(dt);
   if (IsUsingT32()) {
     // VPUSH{<c>}{<q>}{.<size>} <dreglist> ; T1
-    if ((((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+    if (((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitT32_32(0xed2d0b00U | dreg.Encode(22, 12) | (len & 0xff));
@@ -21242,7 +21206,7 @@ void Assembler::vpush(Condition cond, DataType dt, DRegisterList dreglist) {
   } else {
     // VPUSH{<c>}{<q>}{.<size>} <dreglist> ; A1
     if (cond.IsNotNever() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitA32(0x0d2d0b00U | (cond.GetCondition() << 28) | dreg.Encode(22, 12) |
@@ -24756,8 +24720,8 @@ void Assembler::vst1(Condition cond,
       // VST1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; T1
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 4) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -24788,8 +24752,8 @@ void Assembler::vst1(Condition cond,
       // VST1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; T1
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 4) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -24819,8 +24783,8 @@ void Assembler::vst1(Condition cond,
       }
       // VST1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; T1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferOneLane() &&
-          (nreglist.GetLength() == 1) && (operand.GetAddrMode() == Offset) &&
-          encoded_align_2.IsValid() && ((!rn.IsPC()) || AllowUnpredictable())) {
+          (nreglist.GetLength() == 1) && operand.IsOffset() &&
+          encoded_align_2.IsValid() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf980000fU | (encoded_dt_2.GetEncodingValue() << 10) |
@@ -24832,8 +24796,8 @@ void Assembler::vst1(Condition cond,
       }
       // VST1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; T1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferOneLane() &&
-          (nreglist.GetLength() == 1) && (operand.GetAddrMode() == PostIndex) &&
-          encoded_align_2.IsValid() && ((!rn.IsPC()) || AllowUnpredictable())) {
+          (nreglist.GetLength() == 1) && operand.IsPostIndex() &&
+          encoded_align_2.IsValid() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf980000dU | (encoded_dt_2.GetEncodingValue() << 10) |
@@ -24847,8 +24811,8 @@ void Assembler::vst1(Condition cond,
       // VST1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; A1
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 4) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -24878,8 +24842,8 @@ void Assembler::vst1(Condition cond,
       // VST1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; A1
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           (nreglist.IsSingleSpaced()) && (nreglist.GetLength() <= 4) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -24908,8 +24872,8 @@ void Assembler::vst1(Condition cond,
       }
       // VST1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}] ; A1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferOneLane() &&
-          (nreglist.GetLength() == 1) && (operand.GetAddrMode() == Offset) &&
-          encoded_align_2.IsValid() && ((!rn.IsPC()) || AllowUnpredictable())) {
+          (nreglist.GetLength() == 1) && operand.IsOffset() &&
+          encoded_align_2.IsValid() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf480000fU | (encoded_dt_2.GetEncodingValue() << 10) |
@@ -24920,8 +24884,8 @@ void Assembler::vst1(Condition cond,
       }
       // VST1{<c>}{<q>}.<dt> <list>, [<Rn>{:<align>}]! ; A1
       if (encoded_dt_2.IsValid() && nreglist.IsTransferOneLane() &&
-          (nreglist.GetLength() == 1) && (operand.GetAddrMode() == PostIndex) &&
-          encoded_align_2.IsValid() && ((!rn.IsPC()) || AllowUnpredictable())) {
+          (nreglist.GetLength() == 1) && operand.IsPostIndex() &&
+          encoded_align_2.IsValid() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf480000dU | (encoded_dt_2.GetEncodingValue() << 10) |
@@ -25050,8 +25014,8 @@ void Assembler::vst2(Condition cond,
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -25077,8 +25041,8 @@ void Assembler::vst2(Condition cond,
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -25103,8 +25067,8 @@ void Assembler::vst2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf980010fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25118,8 +25082,8 @@ void Assembler::vst2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf980010dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25135,8 +25099,8 @@ void Assembler::vst2(Condition cond,
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -25161,8 +25125,8 @@ void Assembler::vst2(Condition cond,
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding;
@@ -25186,8 +25150,8 @@ void Assembler::vst2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf480010fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25200,8 +25164,8 @@ void Assembler::vst2(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 2)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 2))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf480010dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25321,8 +25285,8 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x4 : 0x5;
@@ -25338,8 +25302,8 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x4 : 0x5;
@@ -25356,8 +25320,8 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x4 : 0x5;
@@ -25372,8 +25336,8 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x4 : 0x5;
@@ -25445,8 +25409,7 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf980020fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25460,8 +25423,7 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPreIndex() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf980020dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25476,8 +25438,7 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == Offset) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf480020fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25490,8 +25451,7 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          (operand.GetAddrMode() == PreIndex) &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPreIndex() && (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf480020dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25513,7 +25473,7 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          sign.IsPlus() && (operand.GetAddrMode() == PostIndex)) {
+          sign.IsPlus() && operand.IsPostIndex()) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf9800200U | (encoded_dt.GetEncodingValue() << 10) |
@@ -25529,7 +25489,7 @@ void Assembler::vst3(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 3)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 3))) &&
-          sign.IsPlus() && (operand.GetAddrMode() == PostIndex)) {
+          sign.IsPlus() && operand.IsPostIndex()) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf4800200U | (encoded_dt.GetEncodingValue() << 10) |
@@ -25560,8 +25520,8 @@ void Assembler::vst4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -25577,8 +25537,8 @@ void Assembler::vst4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -25594,8 +25554,8 @@ void Assembler::vst4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf980030fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25609,8 +25569,8 @@ void Assembler::vst4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al) || AllowStronglyDiscouraged()) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitT32_32(0xf980030dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25625,8 +25585,8 @@ void Assembler::vst4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -25641,8 +25601,8 @@ void Assembler::vst4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferMultipleLanes() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_1.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_1.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           uint32_t len_encoding = nreglist.IsSingleSpaced() ? 0x0 : 0x1;
@@ -25657,8 +25617,8 @@ void Assembler::vst4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == Offset) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsOffset() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf480030fU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25671,8 +25631,8 @@ void Assembler::vst4(Condition cond,
       if (encoded_dt.IsValid() && nreglist.IsTransferOneLane() &&
           ((nreglist.IsSingleSpaced() && (nreglist.GetLength() == 4)) ||
            (nreglist.IsDoubleSpaced() && (nreglist.GetLength() == 4))) &&
-          (operand.GetAddrMode() == PostIndex) && encoded_align_2.IsValid() &&
-          ((!rn.IsPC()) || AllowUnpredictable())) {
+          operand.IsPostIndex() && encoded_align_2.IsValid() &&
+          (!rn.IsPC() || AllowUnpredictable())) {
         if (cond.Is(al)) {
           const DRegister& first = nreglist.GetFirstDRegister();
           EmitA32(0xf480030dU | (encoded_dt.GetEncodingValue() << 10) |
@@ -25766,7 +25726,7 @@ void Assembler::vstm(Condition cond,
   USE(dt);
   if (IsUsingT32()) {
     // VSTM{<c>}{<q>}{.<size>} <Rn>{!}, <dreglist> ; T1
-    if ((((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+    if (((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitT32_32(0xec800b00U | (rn.GetCode() << 16) |
@@ -25778,7 +25738,7 @@ void Assembler::vstm(Condition cond,
   } else {
     // VSTM{<c>}{<q>}{.<size>} <Rn>{!}, <dreglist> ; A1
     if (cond.IsNotNever() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitA32(0x0c800b00U | (cond.GetCondition() << 28) | (rn.GetCode() << 16) |
@@ -25832,7 +25792,7 @@ void Assembler::vstmdb(Condition cond,
   if (IsUsingT32()) {
     // VSTMDB{<c>}{<q>}{.<size>} <Rn>!, <dreglist> ; T1
     if (write_back.DoesWriteBack() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitT32_32(0xed200b00U | (rn.GetCode() << 16) | dreg.Encode(22, 12) |
@@ -25843,7 +25803,7 @@ void Assembler::vstmdb(Condition cond,
   } else {
     // VSTMDB{<c>}{<q>}{.<size>} <Rn>!, <dreglist> ; A1
     if (write_back.DoesWriteBack() && cond.IsNotNever() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitA32(0x0d200b00U | (cond.GetCondition() << 28) | (rn.GetCode() << 16) |
@@ -25895,7 +25855,7 @@ void Assembler::vstmia(Condition cond,
   USE(dt);
   if (IsUsingT32()) {
     // VSTMIA{<c>}{<q>}{.<size>} <Rn>{!}, <dreglist> ; T1
-    if ((((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+    if (((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitT32_32(0xec800b00U | (rn.GetCode() << 16) |
@@ -25907,7 +25867,7 @@ void Assembler::vstmia(Condition cond,
   } else {
     // VSTMIA{<c>}{<q>}{.<size>} <Rn>{!}, <dreglist> ; A1
     if (cond.IsNotNever() &&
-        (((dreglist.GetLength() <= 16)) || AllowUnpredictable())) {
+        ((dreglist.GetLength() <= 16) || AllowUnpredictable())) {
       const DRegister& dreg = dreglist.GetFirstDRegister();
       unsigned len = dreglist.GetLength() * 2;
       EmitA32(0x0c800b00U | (cond.GetCondition() << 28) | (rn.GetCode() << 16) |
@@ -25962,7 +25922,7 @@ void Assembler::vstr(Condition cond,
     if (IsUsingT32()) {
       // VSTR{<c>}{<q>}{.64} <Dd>, [<Rn>{, #{+/-}<imm>}] ; T1
       if (dt.IsNoneOr(Untyped64) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && (operand.GetAddrMode() == Offset)) {
+          ((offset % 4) == 0) && operand.IsOffset()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xed000b00U | rd.Encode(22, 12) | (rn.GetCode() << 16) |
@@ -25973,8 +25933,7 @@ void Assembler::vstr(Condition cond,
     } else {
       // VSTR{<c>}{<q>}{.64} <Dd>, [<Rn>{, #{+/-}<imm>}] ; A1
       if (dt.IsNoneOr(Untyped64) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever()) {
+          ((offset % 4) == 0) && operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitA32(0x0d000b00U | (cond.GetCondition() << 28) | rd.Encode(22, 12) |
@@ -25998,7 +25957,7 @@ void Assembler::vstr(Condition cond,
     if (IsUsingT32()) {
       // VSTR{<c>}{<q>}{.32} <Sd>, [<Rn>{, #{+/-}<imm>}] ; T2
       if (dt.IsNoneOr(Untyped32) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && (operand.GetAddrMode() == Offset)) {
+          ((offset % 4) == 0) && operand.IsOffset()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitT32_32(0xed000a00U | rd.Encode(22, 12) | (rn.GetCode() << 16) |
@@ -26009,8 +25968,7 @@ void Assembler::vstr(Condition cond,
     } else {
       // VSTR{<c>}{<q>}{.32} <Sd>, [<Rn>{, #{+/-}<imm>}] ; A2
       if (dt.IsNoneOr(Untyped32) && (offset >= -1020) && (offset <= 1020) &&
-          ((offset % 4) == 0) && (operand.GetAddrMode() == Offset) &&
-          cond.IsNotNever()) {
+          ((offset % 4) == 0) && operand.IsOffset() && cond.IsNotNever()) {
         uint32_t sign = operand.GetSign().IsPlus() ? 1 : 0;
         uint32_t offset_ = abs(offset) >> 2;
         EmitA32(0x0d000a00U | (cond.GetCondition() << 28) | rd.Encode(22, 12) |

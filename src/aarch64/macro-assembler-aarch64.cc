@@ -26,7 +26,7 @@
 
 #include <cctype>
 
-#include "aarch64/macro-assembler-aarch64.h"
+#include "macro-assembler-aarch64.h"
 
 namespace vixl {
 namespace aarch64 {
@@ -90,6 +90,23 @@ void LiteralPool::CheckEmitFor(size_t amount, EmitOption option) {
 }
 
 
+// We use a subclass to access the protected `ExactAssemblyScope` constructor
+// giving us control over the pools. This allows us to use this scope within
+// code emitting pools without creating a circular dependency.
+// We keep the constructor private to restrict usage of this helper class.
+class ExactAssemblyScopeWithoutPoolsCheck : public ExactAssemblyScope {
+ private:
+  ExactAssemblyScopeWithoutPoolsCheck(MacroAssembler* masm, size_t size)
+      : ExactAssemblyScope(masm,
+                           size,
+                           ExactAssemblyScope::kExactSize,
+                           ExactAssemblyScope::kIgnorePools) {}
+
+  friend void LiteralPool::Emit(LiteralPool::EmitOption);
+  friend void VeneerPool::Emit(VeneerPool::EmitOption, size_t);
+};
+
+
 void LiteralPool::Emit(EmitOption option) {
   // There is an issue if we are asked to emit a blocked or empty pool.
   VIXL_ASSERT(!IsBlocked());
@@ -111,20 +128,14 @@ void LiteralPool::Emit(EmitOption option) {
     masm_->SetAllowMacroInstructions(false);
 #endif
     if (option == kBranchRequired) {
-      InstructionAccurateScope guard(masm_,
-                                     1,
-                                     CodeBufferCheckScope::kExactSize,
-                                     EmissionCheckScope::kIgnorePools);
+      ExactAssemblyScopeWithoutPoolsCheck guard(masm_, kInstructionSize);
       masm_->b(&end_of_pool);
     }
 
     {
       // Marker indicating the size of the literal pool in 32-bit words.
       VIXL_ASSERT((pool_size % kWRegSizeInBytes) == 0);
-      InstructionAccurateScope guard(masm_,
-                                     1,
-                                     CodeBufferCheckScope::kExactSize,
-                                     EmissionCheckScope::kIgnorePools);
+      ExactAssemblyScopeWithoutPoolsCheck guard(masm_, kInstructionSize);
       masm_->ldr(xzr, static_cast<int>(pool_size / kWRegSizeInBytes));
     }
 
@@ -250,10 +261,7 @@ void VeneerPool::Emit(EmitOption option, size_t amount) {
 
   Label end;
   if (option == kBranchRequired) {
-    InstructionAccurateScope guard(masm_,
-                                   1,
-                                   CodeBufferCheckScope::kExactSize,
-                                   EmissionCheckScope::kIgnorePools);
+    ExactAssemblyScopeWithoutPoolsCheck guard(masm_, kInstructionSize);
     masm_->b(&end);
   }
 
@@ -279,10 +287,7 @@ void VeneerPool::Emit(EmitOption option, size_t amount) {
       Instruction* veneer = masm_->GetCursorAddress<Instruction*>();
       branch->SetImmPCOffsetTarget(veneer);
       {
-        InstructionAccurateScope guard(masm_,
-                                       1,
-                                       CodeBufferCheckScope::kExactSize,
-                                       EmissionCheckScope::kIgnorePools);
+        ExactAssemblyScopeWithoutPoolsCheck guard(masm_, kInstructionSize);
         masm_->b(label);
       }
 
@@ -301,59 +306,6 @@ void VeneerPool::Emit(EmitOption option, size_t amount) {
 }
 
 
-EmissionCheckScope::EmissionCheckScope(MacroAssembler* masm,
-                                       size_t size,
-                                       AssertPolicy assert_policy) {
-  Open(masm, size, assert_policy);
-}
-
-
-EmissionCheckScope::~EmissionCheckScope() { Close(); }
-
-
-EmissionCheckScope::EmissionCheckScope(MacroAssembler* masm,
-                                       size_t size,
-                                       AssertPolicy assert_policy,
-                                       PoolPolicy pool_policy) {
-  Open(masm, size, assert_policy, pool_policy);
-}
-
-
-void EmissionCheckScope::Open(MacroAssembler* masm,
-                              size_t size,
-                              AssertPolicy assert_policy,
-                              PoolPolicy pool_policy) {
-  masm_ = masm;
-  pool_policy_ = pool_policy;
-  if (masm_ == NULL) {
-    // Nothing to do.
-    // We may reach this point in a context of conditional code generation. See
-    // `MacroAssembler::MoveImmediateHelper()` for an example.
-    return;
-  }
-  if (pool_policy_ == kCheckPools) {
-    // Do not use the more generic `EnsureEmitFor()` to avoid duplicating the
-    // work to check that enough space is available in the buffer. It is done
-    // below when opening `CodeBufferCheckScope`.
-    masm_->EnsureEmitPoolsFor(size);
-    masm_->BlockPools();
-  }
-  // The buffer should be checked *after* we emit the pools.
-  CodeBufferCheckScope::Open(masm_, size, kCheck, assert_policy);
-}
-
-
-void EmissionCheckScope::Close() {
-  if (masm_ == NULL) {
-    // Nothing to do.
-    return;
-  }
-  if (pool_policy_ == kCheckPools) {
-    masm_->ReleasePools();
-  }
-}
-
-
 MacroAssembler::MacroAssembler(PositionIndependentCodeOption pic)
     : Assembler(pic),
 #ifdef VIXL_DEBUG
@@ -363,6 +315,7 @@ MacroAssembler::MacroAssembler(PositionIndependentCodeOption pic)
       sp_(sp),
       tmp_list_(ip0, ip1),
       fptmp_list_(d31),
+      current_scratch_scope_(NULL),
       literal_pool_(this),
       veneer_pool_(this),
       recommended_checkpoint_(Pool::kNoCheckpointRequired) {
@@ -383,6 +336,7 @@ MacroAssembler::MacroAssembler(size_t capacity,
       sp_(sp),
       tmp_list_(ip0, ip1),
       fptmp_list_(d31),
+      current_scratch_scope_(NULL),
       literal_pool_(this),
       veneer_pool_(this),
       recommended_checkpoint_(Pool::kNoCheckpointRequired) {
@@ -401,6 +355,7 @@ MacroAssembler::MacroAssembler(byte* buffer,
       sp_(sp),
       tmp_list_(ip0, ip1),
       fptmp_list_(d31),
+      current_scratch_scope_(NULL),
       literal_pool_(this),
       veneer_pool_(this),
       recommended_checkpoint_(Pool::kNoCheckpointRequired) {
@@ -432,12 +387,7 @@ void MacroAssembler::FinalizeCode() {
 
 void MacroAssembler::CheckEmitFor(size_t amount) {
   CheckEmitPoolsFor(amount);
-  ptrdiff_t offset = amount;
-  // Ensure there's enough space for the emit, keep in mind the cursor will
-  // have moved if a pool was emitted.
-  if ((GetCursorOffset() + offset) > GetBufferEndOffset()) {
-    EnsureSpaceFor(amount);
-  }
+  GetBuffer()->EnsureSpaceFor(amount);
 }
 
 
@@ -1614,8 +1564,8 @@ void MacroAssembler::Move(const GenericOperand& dst,
 
   // The sizes of the operands must match exactly.
   VIXL_ASSERT(dst.GetSizeInBits() == src.GetSizeInBits());
-  size_t operand_size = dst.GetSizeInBits();
-  VIXL_ASSERT(operand_size <= kXRegSize);
+  VIXL_ASSERT(dst.GetSizeInBits() <= kXRegSize);
+  int operand_size = static_cast<int>(dst.GetSizeInBits());
 
   if (dst.IsCPURegister() && src.IsCPURegister()) {
     CPURegister dst_reg = dst.GetCPURegister();
@@ -2065,9 +2015,9 @@ void MacroAssembler::PushHelper(int count,
                                 const CPURegister& src3) {
   // Ensure that we don't unintentionally modify scratch or debug registers.
   // Worst case for size is 2 stp.
-  InstructionAccurateScope scope(this,
-                                 2,
-                                 InstructionAccurateScope::kMaximumSize);
+  ExactAssemblyScope scope(this,
+                           2 * kInstructionSize,
+                           ExactAssemblyScope::kMaximumSize);
 
   VIXL_ASSERT(AreSameSizeAndType(src0, src1, src2, src3));
   VIXL_ASSERT(size == src0.GetSizeInBytes());
@@ -2109,9 +2059,9 @@ void MacroAssembler::PopHelper(int count,
                                const CPURegister& dst3) {
   // Ensure that we don't unintentionally modify scratch or debug registers.
   // Worst case for size is 2 ldp.
-  InstructionAccurateScope scope(this,
-                                 2,
-                                 InstructionAccurateScope::kMaximumSize);
+  ExactAssemblyScope scope(this,
+                           2 * kInstructionSize,
+                           ExactAssemblyScope::kMaximumSize);
 
   VIXL_ASSERT(AreSameSizeAndType(dst0, dst1, dst2, dst3));
   VIXL_ASSERT(size == dst0.GetSizeInBytes());
@@ -2235,7 +2185,7 @@ void MacroAssembler::PushCalleeSavedRegisters() {
   // Ensure that the macro-assembler doesn't use any scratch registers.
   // 10 stp will be emitted.
   // TODO(all): Should we use GetCalleeSaved and SavedFP.
-  InstructionAccurateScope scope(this, 10);
+  ExactAssemblyScope scope(this, 10 * kInstructionSize);
 
   // This method must not be called unless the current stack pointer is sp.
   VIXL_ASSERT(sp.Is(StackPointer()));
@@ -2260,7 +2210,7 @@ void MacroAssembler::PopCalleeSavedRegisters() {
   // Ensure that the macro-assembler doesn't use any scratch registers.
   // 10 ldp will be emitted.
   // TODO(all): Should we use GetCalleeSaved and SavedFP.
-  InstructionAccurateScope scope(this, 10);
+  ExactAssemblyScope scope(this, 10 * kInstructionSize);
 
   // This method must not be called unless the current stack pointer is sp.
   VIXL_ASSERT(sp.Is(StackPointer()));
@@ -2376,7 +2326,7 @@ void MacroAssembler::BumpSystemStackPointer(const Operand& space) {
   // TODO: Several callers rely on this not using scratch registers, so we use
   // the assembler directly here. However, this means that large immediate
   // values of 'space' cannot be handled.
-  InstructionAccurateScope scope(this, 1);
+  ExactAssemblyScope scope(this, kInstructionSize);
   sub(sp, StackPointer(), space);
 }
 
@@ -2517,7 +2467,7 @@ void MacroAssembler::PrintfNoPreserve(const char* format,
   // since the system printf function will use a different instruction set and
   // the procedure-call standard will not be compatible.
   if (generate_simulator_code_) {
-    InstructionAccurateScope scope(this, kPrintfLength / kInstructionSize);
+    ExactAssemblyScope scope(this, kPrintfLength);
     hlt(kPrintfOpcode);
     dc32(arg_count);  // kPrintfArgCountOffset
 
@@ -2620,7 +2570,7 @@ void MacroAssembler::Trace(TraceParameters parameters, TraceCommand command) {
   if (generate_simulator_code_) {
     // The arguments to the trace pseudo instruction need to be contiguous in
     // memory, so make sure we don't try to emit a literal pool.
-    InstructionAccurateScope scope(this, kTraceLength / kInstructionSize);
+    ExactAssemblyScope scope(this, kTraceLength);
 
     Label start;
     bind(&start);
@@ -2647,7 +2597,7 @@ void MacroAssembler::Log(TraceParameters parameters) {
   if (generate_simulator_code_) {
     // The arguments to the log pseudo instruction need to be contiguous in
     // memory, so make sure we don't try to emit a literal pool.
-    InstructionAccurateScope scope(this, kLogLength / kInstructionSize);
+    ExactAssemblyScope scope(this, kLogLength);
 
     Label start;
     bind(&start);
@@ -2667,14 +2617,14 @@ void MacroAssembler::Log(TraceParameters parameters) {
 
 void MacroAssembler::EnableInstrumentation() {
   VIXL_ASSERT(!isprint(InstrumentStateEnable));
-  InstructionAccurateScope scope(this, 1);
+  ExactAssemblyScope scope(this, kInstructionSize);
   movn(xzr, InstrumentStateEnable);
 }
 
 
 void MacroAssembler::DisableInstrumentation() {
   VIXL_ASSERT(!isprint(InstrumentStateDisable));
-  InstructionAccurateScope scope(this, 1);
+  ExactAssemblyScope scope(this, kInstructionSize);
   movn(xzr, InstrumentStateDisable);
 }
 
@@ -2686,87 +2636,69 @@ void MacroAssembler::AnnotateInstrumentation(const char* marker_name) {
   // characters are reserved for controlling features of the instrumentation.
   VIXL_ASSERT(isprint(marker_name[0]) && isprint(marker_name[1]));
 
-  InstructionAccurateScope scope(this, 1);
+  ExactAssemblyScope scope(this, kInstructionSize);
   movn(xzr, (marker_name[1] << 8) | marker_name[0]);
 }
 
 
 void UseScratchRegisterScope::Open(MacroAssembler* masm) {
-  VIXL_ASSERT(!initialised_);
+  VIXL_ASSERT(masm_ == NULL);
   VIXL_ASSERT(masm != NULL);
-  available_ = masm->GetScratchRegisterList();
-  availablefp_ = masm->GetScratchFPRegisterList();
-  old_available_ = available_->GetList();
-  old_availablefp_ = availablefp_->GetList();
-  VIXL_ASSERT(available_->GetType() == CPURegister::kRegister);
-  VIXL_ASSERT(availablefp_->GetType() == CPURegister::kVRegister);
-#ifdef VIXL_DEBUG
-  initialised_ = true;
-#endif
+  masm_ = masm;
+
+  CPURegList* available = masm->GetScratchRegisterList();
+  CPURegList* available_fp = masm->GetScratchFPRegisterList();
+  old_available_ = available->GetList();
+  old_availablefp_ = available_fp->GetList();
+  VIXL_ASSERT(available->GetType() == CPURegister::kRegister);
+  VIXL_ASSERT(available_fp->GetType() == CPURegister::kVRegister);
+
+  parent_ = masm->GetCurrentScratchRegisterScope();
+  masm->SetCurrentScratchRegisterScope(this);
 }
 
 
 void UseScratchRegisterScope::Close() {
-  if (available_) {
-    available_->SetList(old_available_);
-    available_ = NULL;
+  if (masm_ != NULL) {
+    // Ensure that scopes nest perfectly, and do not outlive their parents.
+    // This is a run-time check because the order of destruction of objects in
+    // the _same_ scope is implementation-defined, and is likely to change in
+    // optimised builds.
+    VIXL_CHECK(masm_->GetCurrentScratchRegisterScope() == this);
+    masm_->SetCurrentScratchRegisterScope(parent_);
+
+    masm_->GetScratchRegisterList()->SetList(old_available_);
+    masm_->GetScratchFPRegisterList()->SetList(old_availablefp_);
+
+    masm_ = NULL;
   }
-  if (availablefp_) {
-    availablefp_->SetList(old_availablefp_);
-    availablefp_ = NULL;
-  }
-#ifdef VIXL_DEBUG
-  initialised_ = false;
-#endif
 }
-
-
-UseScratchRegisterScope::UseScratchRegisterScope(MacroAssembler* masm) {
-#ifdef VIXL_DEBUG
-  initialised_ = false;
-#else
-  USE(initialised_);
-#endif
-  Open(masm);
-}
-
-// This allows deferred (and optional) initialisation of the scope.
-UseScratchRegisterScope::UseScratchRegisterScope()
-    : available_(NULL),
-      availablefp_(NULL),
-      old_available_(0),
-      old_availablefp_(0) {
-#ifdef VIXL_DEBUG
-  initialised_ = false;
-#endif
-}
-
-UseScratchRegisterScope::~UseScratchRegisterScope() { Close(); }
 
 
 bool UseScratchRegisterScope::IsAvailable(const CPURegister& reg) const {
-  return available_->IncludesAliasOf(reg) || availablefp_->IncludesAliasOf(reg);
+  return masm_->GetScratchRegisterList()->IncludesAliasOf(reg) ||
+         masm_->GetScratchFPRegisterList()->IncludesAliasOf(reg);
 }
 
 
 Register UseScratchRegisterScope::AcquireRegisterOfSize(int size_in_bits) {
-  int code = AcquireNextAvailable(available_).GetCode();
+  int code = AcquireNextAvailable(masm_->GetScratchRegisterList()).GetCode();
   return Register(code, size_in_bits);
 }
 
 
 FPRegister UseScratchRegisterScope::AcquireVRegisterOfSize(int size_in_bits) {
-  int code = AcquireNextAvailable(availablefp_).GetCode();
+  int code = AcquireNextAvailable(masm_->GetScratchFPRegisterList()).GetCode();
   return FPRegister(code, size_in_bits);
 }
 
 
 void UseScratchRegisterScope::Release(const CPURegister& reg) {
-  VIXL_ASSERT(initialised_);
+  VIXL_ASSERT(masm_ != NULL);
   if (reg.IsRegister()) {
-    ReleaseByCode(available_, reg.GetCode());
+    ReleaseByCode(masm_->GetScratchRegisterList(), reg.GetCode());
   } else if (reg.IsFPRegister()) {
-    ReleaseByCode(availablefp_, reg.GetCode());
+    ReleaseByCode(masm_->GetScratchFPRegisterList(), reg.GetCode());
   } else {
     VIXL_ASSERT(reg.IsNone());
   }
@@ -2774,14 +2706,14 @@ void UseScratchRegisterScope::Release(const CPURegister& reg) {
 
 
 void UseScratchRegisterScope::Include(const CPURegList& list) {
-  VIXL_ASSERT(initialised_);
+  VIXL_ASSERT(masm_ != NULL);
   if (list.GetType() == CPURegister::kRegister) {
     // Make sure that neither sp nor xzr are included the list.
-    IncludeByRegList(available_,
+    IncludeByRegList(masm_->GetScratchRegisterList(),
                      list.GetList() & ~(xzr.GetBit() | sp.GetBit()));
   } else {
     VIXL_ASSERT(list.GetType() == CPURegister::kVRegister);
-    IncludeByRegList(availablefp_, list.GetList());
+    IncludeByRegList(masm_->GetScratchFPRegisterList(), list.GetList());
   }
 }
 
@@ -2790,13 +2722,13 @@ void UseScratchRegisterScope::Include(const Register& reg1,
                                       const Register& reg2,
                                       const Register& reg3,
                                       const Register& reg4) {
-  VIXL_ASSERT(initialised_);
+  VIXL_ASSERT(masm_ != NULL);
   RegList include =
       reg1.GetBit() | reg2.GetBit() | reg3.GetBit() | reg4.GetBit();
   // Make sure that neither sp nor xzr are included the list.
   include &= ~(xzr.GetBit() | sp.GetBit());
 
-  IncludeByRegList(available_, include);
+  IncludeByRegList(masm_->GetScratchRegisterList(), include);
 }
 
 
@@ -2806,16 +2738,16 @@ void UseScratchRegisterScope::Include(const FPRegister& reg1,
                                       const FPRegister& reg4) {
   RegList include =
       reg1.GetBit() | reg2.GetBit() | reg3.GetBit() | reg4.GetBit();
-  IncludeByRegList(availablefp_, include);
+  IncludeByRegList(masm_->GetScratchFPRegisterList(), include);
 }
 
 
 void UseScratchRegisterScope::Exclude(const CPURegList& list) {
   if (list.GetType() == CPURegister::kRegister) {
-    ExcludeByRegList(available_, list.GetList());
+    ExcludeByRegList(masm_->GetScratchRegisterList(), list.GetList());
   } else {
     VIXL_ASSERT(list.GetType() == CPURegister::kVRegister);
-    ExcludeByRegList(availablefp_, list.GetList());
+    ExcludeByRegList(masm_->GetScratchFPRegisterList(), list.GetList());
   }
 }
 
@@ -2826,7 +2758,7 @@ void UseScratchRegisterScope::Exclude(const Register& reg1,
                                       const Register& reg4) {
   RegList exclude =
       reg1.GetBit() | reg2.GetBit() | reg3.GetBit() | reg4.GetBit();
-  ExcludeByRegList(available_, exclude);
+  ExcludeByRegList(masm_->GetScratchRegisterList(), exclude);
 }
 
 
@@ -2836,7 +2768,7 @@ void UseScratchRegisterScope::Exclude(const FPRegister& reg1,
                                       const FPRegister& reg4) {
   RegList excludefp =
       reg1.GetBit() | reg2.GetBit() | reg3.GetBit() | reg4.GetBit();
-  ExcludeByRegList(availablefp_, excludefp);
+  ExcludeByRegList(masm_->GetScratchFPRegisterList(), excludefp);
 }
 
 
@@ -2859,14 +2791,16 @@ void UseScratchRegisterScope::Exclude(const CPURegister& reg1,
     }
   }
 
-  ExcludeByRegList(available_, exclude);
-  ExcludeByRegList(availablefp_, excludefp);
+  ExcludeByRegList(masm_->GetScratchRegisterList(), exclude);
+  ExcludeByRegList(masm_->GetScratchFPRegisterList(), excludefp);
 }
 
 
 void UseScratchRegisterScope::ExcludeAll() {
-  ExcludeByRegList(available_, available_->GetList());
-  ExcludeByRegList(availablefp_, availablefp_->GetList());
+  ExcludeByRegList(masm_->GetScratchRegisterList(),
+                   masm_->GetScratchRegisterList()->GetList());
+  ExcludeByRegList(masm_->GetScratchFPRegisterList(),
+                   masm_->GetScratchFPRegisterList()->GetList());
 }
 
 

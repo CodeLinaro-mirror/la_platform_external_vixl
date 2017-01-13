@@ -41,6 +41,10 @@ bool vixl::Test::debug_ = false;
 bool vixl::Test::trace_sim_ = false;
 bool vixl::Test::trace_reg_ = false;
 bool vixl::Test::trace_write_ = false;
+bool vixl::Test::trace_branch_ = false;
+
+// Do not disassemble by default.
+bool vixl::Test::disassemble_ = false;
 
 // No colour highlight by default.
 bool vixl::Test::coloured_trace_ = false;
@@ -107,6 +111,8 @@ static void PrintHelpMessage() {
       "                       well as disassembly from the DISASM tests.\n"
       "--trace_reg            Generate a trace of simulated registers.\n"
       "--trace_write          Generate a trace of memory writes.\n"
+      "--trace_branch         Generate a trace of branches taken.\n"
+      "--disassemble          Disassemble and print generated instructions.\n"
       "--coloured_trace       Generate coloured trace.\n"
       "--instruction_stats    Log instruction statistics to vixl_stats.csv.\n"
       "--generate_test_trace  "
@@ -132,6 +138,7 @@ int main(int argc, char* argv[]) {
   if (IsInArgs("--trace-all", argc, argv)) {
     vixl::Test::set_trace_reg(true);
     vixl::Test::set_trace_write(true);
+    vixl::Test::set_trace_branch(true);
     vixl::Test::set_trace_sim(true);
     vixl::Test::set_coloured_trace(true);
   }
@@ -148,12 +155,20 @@ int main(int argc, char* argv[]) {
     vixl::Test::set_trace_write(true);
   }
 
+  if (IsInArgs("--trace-branch", argc, argv)) {
+    vixl::Test::set_trace_branch(true);
+  }
+
   if (IsInArgs("--trace-reg", argc, argv)) {
     vixl::Test::set_trace_reg(true);
   }
 
   if (IsInArgs("--trace-sim", argc, argv)) {
     vixl::Test::set_trace_sim(true);
+  }
+
+  if (IsInArgs("--disassemble", argc, argv)) {
+    vixl::Test::set_disassemble(true);
   }
 
   if (IsInArgs("--instruction-stats", argc, argv)) {

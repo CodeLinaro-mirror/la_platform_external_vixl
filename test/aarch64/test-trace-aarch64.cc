@@ -48,7 +48,7 @@ namespace aarch64 {
 #define TEST(name) TEST_(TRACE_##name)
 
 static void GenerateTestSequenceBase(MacroAssembler* masm) {
-  CodeBufferCheckScope guard(masm, masm->GetRemainingBufferSpace());
+  CodeBufferCheckScope guard(masm, masm->GetBuffer()->GetRemainingBytes());
 
   __ adc(w3, w4, w5);
   __ adc(x6, x7, x8);
@@ -366,11 +366,31 @@ static void GenerateTestSequenceBase(MacroAssembler* masm) {
   __ uxth(x6, x7);
   __ uxtw(w8, w9);
   __ uxtw(x10, x11);
+
+  // Branch tests.
+  {
+    Label end;
+    // Branch to the next instruction.
+    __ b(&end);
+    __ bind(&end);
+  }
+  {
+    Label loop, end;
+    __ subs(x3, x3, x3);
+    __ bind(&loop);
+    // Not-taken branch (the first time).
+    // Taken branch (the second time).
+    __ b(&end, ne);
+    __ cmp(x3, 1);
+    // Backwards branch.
+    __ b(&loop);
+    __ bind(&end);
+  }
 }
 
 
 static void GenerateTestSequenceFP(MacroAssembler* masm) {
-  CodeBufferCheckScope guard(masm, masm->GetRemainingBufferSpace());
+  CodeBufferCheckScope guard(masm, masm->GetBuffer()->GetRemainingBytes());
 
   // Scalar floating point instructions.
   __ fabd(d13, d2, d19);
@@ -582,7 +602,7 @@ static void GenerateTestSequenceFP(MacroAssembler* masm) {
 
 
 static void GenerateTestSequenceNEON(MacroAssembler* masm) {
-  CodeBufferCheckScope guard(masm, masm->GetRemainingBufferSpace());
+  CodeBufferCheckScope guard(masm, masm->GetBuffer()->GetRemainingBytes());
 
   // NEON integer instructions.
   __ abs(d19, d0);
@@ -2292,7 +2312,7 @@ static void GenerateTestSequenceNEON(MacroAssembler* masm) {
 
 
 static void GenerateTestSequenceNEONFP(MacroAssembler* masm) {
-  CodeBufferCheckScope guard(masm, masm->GetRemainingBufferSpace());
+  CodeBufferCheckScope guard(masm, masm->GetBuffer()->GetRemainingBytes());
 
   // NEON floating point instructions.
   __ fabd(v3.V2D(), v25.V2D(), v8.V2D());
@@ -2543,7 +2563,10 @@ static void MaskAddresses(const char* trace) {
       // Mask accessed memory addresses.
       {"((<-|->) " COLOUR "0x)[0-9a-f]{16}", ESCAPE(1) "~~~~~~~~~~~~~~~~"},
       // Mask instruction addresses.
-      {"^0x[0-9a-f]{16}", "0x~~~~~~~~~~~~~~~~"}
+      {"^0x[0-9a-f]{16}", "0x~~~~~~~~~~~~~~~~"},
+      // Mask branch targets.
+      {"(Branch" COLOUR " to 0x)[0-9a-f]{16}", ESCAPE(1) "~~~~~~~~~~~~~~~~"},
+      {"addr 0x[0-9a-f]+", "addr 0x~~~~~~~~~~~~~~~~"}
   };
   const size_t patterns_length = sizeof(patterns) / sizeof(patterns[0]);
   // Rewrite `trace`, masking addresses and other values that legitimately vary
@@ -2566,8 +2589,7 @@ static void TraceTestHelper(bool coloured_trace,
   MacroAssembler masm(12 * KBytes);
 
   char trace_stream_filename[] = "/tmp/vixl-test-trace-XXXXXX";
-  int trace_stream_fd = mkstemp(trace_stream_filename);
-  FILE* trace_stream = fdopen(trace_stream_fd, "w");
+  FILE* trace_stream = fdopen(mkstemp(trace_stream_filename), "w");
 
   Decoder decoder;
   Simulator simulator(&decoder, trace_stream);
@@ -2622,11 +2644,12 @@ static void TraceTestHelper(bool coloured_trace,
   masm.Ret();
   masm.FinalizeCode();
 
-  simulator.RunFrom(masm.GetStartAddress<Instruction*>());
+  simulator.RunFrom(masm.GetBuffer()->GetStartAddress<Instruction*>());
 
   fclose(trace_stream);
   MaskAddresses(trace_stream_filename);
 
+  bool trace_matched_reference;
   if (Test::generate_test_trace()) {
     // Copy trace_stream to stdout.
     trace_stream = fopen(trace_stream_filename, "r");
@@ -2639,21 +2662,25 @@ static void TraceTestHelper(bool coloured_trace,
       putc(c, stdout);
     }
     fclose(trace_stream);
+    trace_matched_reference = true;
   } else {
     // Check trace_stream against ref_file.
     char command[1024];
     size_t length = snprintf(command, sizeof(command),
                              "diff -u %s %s", ref_file, trace_stream_filename);
     VIXL_CHECK(length < sizeof(command));
-    VIXL_CHECK(system(command) == 0);
+    trace_matched_reference = (system(command) == 0);
   }
 
   uint64_t offset_base = simulator.ReadRegister<uint64_t>(0);
   uint64_t index_base = simulator.ReadRegister<uint64_t>(1);
+
+  // Clean up before checking the result; VIXL_CHECK aborts.
+  remove(trace_stream_filename);
+
+  VIXL_CHECK(trace_matched_reference);
   VIXL_CHECK(index_base >= offset_base);
   VIXL_CHECK((index_base - offset_base) <= kScratchSize);
-
-  // remove(trace_stream_filename);
 }
 
 
@@ -2674,6 +2701,9 @@ TEST(sysregs) {
 }
 TEST(write) {
   TraceTestHelper(false, LOG_WRITE, REF("log-write"));
+}
+TEST(branch) {
+  TraceTestHelper(false, LOG_WRITE, REF("log-branch"));
 }
 
 // Test standard combinations.
@@ -2703,6 +2733,9 @@ TEST(sysregs_colour) {
 }
 TEST(write_colour) {
   TraceTestHelper(true, LOG_WRITE, REF("log-write-colour"));
+}
+TEST(branch_colour) {
+  TraceTestHelper(true, LOG_WRITE, REF("log-branch-colour"));
 }
 
 // Test standard combinations (with colour).

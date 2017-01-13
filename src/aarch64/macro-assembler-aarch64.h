@@ -30,15 +30,17 @@
 #include <algorithm>
 #include <limits>
 
-#include "globals-vixl.h"
+#include "../code-generation-scopes-vixl.h"
+#include "../globals-vixl.h"
+#include "../macro-assembler-interface.h"
 
-#include "aarch64/assembler-aarch64.h"
-#include "aarch64/debugger-aarch64.h"
-#include "aarch64/instrument-aarch64.h"
+#include "assembler-aarch64.h"
+#include "debugger-aarch64.h"
+#include "instrument-aarch64.h"
 // Required in order to generate debugging instructions for the simulator. This
 // is needed regardless of whether the simulator is included or not, since
 // generating simulator specific instructions is controlled at runtime.
-#include "aarch64/simulator-constants-aarch64.h"
+#include "simulator-constants-aarch64.h"
 
 
 #define LS_MACRO_LIST(V)                                     \
@@ -497,46 +499,11 @@ class VeneerPool : public Pool {
 };
 
 
-// This scope has the following purposes:
-//  * Acquire/Release the underlying assembler's code buffer.
-//     * This is mandatory before emitting.
-//  * Emit the literal or veneer pools if necessary before emitting the
-//    macro-instruction.
-//  * Ensure there is enough space to emit the macro-instruction.
-class EmissionCheckScope : public CodeBufferCheckScope {
- public:
-  EmissionCheckScope(MacroAssembler* masm,
-                     size_t size,
-                     AssertPolicy assert_policy = kMaximumSize);
-  virtual ~EmissionCheckScope();
-
-  enum PoolPolicy { kIgnorePools, kCheckPools };
-
- protected:
-  // This constructor should only be used from code that is *currently
-  // generating* the pools, to avoid an infinite loop.
-  EmissionCheckScope(MacroAssembler* masm,
-                     size_t size,
-                     AssertPolicy assert_policy,
-                     PoolPolicy pool_policy);
-
-  void Open(MacroAssembler* masm,
-            size_t size,
-            AssertPolicy assert_policy = kMaximumSize,
-            PoolPolicy pool_policy = kCheckPools);
-
-  void Close();
-
-  MacroAssembler* masm_;
-  PoolPolicy pool_policy_;
-};
-
-
 // Helper for common Emission checks.
 // The macro-instruction maps to a single instruction.
 class SingleEmissionCheckScope : public EmissionCheckScope {
  public:
-  explicit SingleEmissionCheckScope(MacroAssembler* masm)
+  explicit SingleEmissionCheckScope(MacroAssemblerInterface* masm)
       : EmissionCheckScope(masm, kInstructionSize) {}
 };
 
@@ -545,7 +512,7 @@ class SingleEmissionCheckScope : public EmissionCheckScope {
 // instruction only emit a few instructions, a few being defined as 8 here.
 class MacroEmissionCheckScope : public EmissionCheckScope {
  public:
-  explicit MacroEmissionCheckScope(MacroAssembler* masm)
+  explicit MacroEmissionCheckScope(MacroAssemblerInterface* masm)
       : EmissionCheckScope(masm, kTypicalMacroInstructionMaxSize) {}
 
  private:
@@ -598,7 +565,7 @@ enum BranchType {
 enum DiscardMoveMode { kDontDiscardForSameWReg, kDiscardForSameWReg };
 
 
-class MacroAssembler : public Assembler {
+class MacroAssembler : public Assembler, public MacroAssemblerInterface {
  public:
   explicit MacroAssembler(
       PositionIndependentCodeOption pic = PositionIndependentCode);
@@ -608,6 +575,10 @@ class MacroAssembler : public Assembler {
                  size_t capacity,
                  PositionIndependentCodeOption pic = PositionIndependentCode);
   ~MacroAssembler();
+
+  virtual internal::AssemblerBase* AsAssemblerBase() VIXL_OVERRIDE {
+    return this;
+  }
 
   // Start generating code from the beginning of the buffer, discarding any code
   // and data that has already been emitted into the buffer.
@@ -2862,13 +2833,13 @@ class MacroAssembler : public Assembler {
   // one instruction. Refer to the implementation for details.
   void BumpSystemStackPointer(const Operand& space);
 
-#ifdef VIXL_DEBUG
-  void SetAllowMacroInstructions(bool value) {
+  virtual void SetAllowMacroInstructions(bool value) VIXL_OVERRIDE {
     allow_macro_instructions_ = value;
   }
 
-  bool AllowMacroInstructions() const { return allow_macro_instructions_; }
-#endif
+  virtual bool AllowMacroInstructions() const VIXL_OVERRIDE {
+    return allow_macro_instructions_;
+  }
 
   void SetGenerateSimulatorCode(bool value) {
     generate_simulator_code_ = value;
@@ -2883,12 +2854,12 @@ class MacroAssembler : public Assembler {
   void ReleaseVeneerPool() { veneer_pool_.Release(); }
   bool IsVeneerPoolBlocked() const { return veneer_pool_.IsBlocked(); }
 
-  void BlockPools() {
+  virtual void BlockPools() VIXL_OVERRIDE {
     BlockLiteralPool();
     BlockVeneerPool();
   }
 
-  void ReleasePools() {
+  virtual void ReleasePools() VIXL_OVERRIDE {
     ReleaseLiteralPool();
     ReleaseVeneerPool();
   }
@@ -2920,7 +2891,8 @@ class MacroAssembler : public Assembler {
   ptrdiff_t GetNextCheckPoint() const {
     ptrdiff_t next_checkpoint_for_pools =
         std::min(literal_pool_.GetCheckpoint(), veneer_pool_.GetCheckpoint());
-    return std::min(next_checkpoint_for_pools, GetBufferEndOffset());
+    return std::min(next_checkpoint_for_pools,
+                    static_cast<ptrdiff_t>(GetBuffer().GetCapacity()));
   }
   VIXL_DEPRECATED("GetNextCheckPoint", ptrdiff_t NextCheckPoint()) {
     return GetNextCheckPoint();
@@ -2946,7 +2918,7 @@ class MacroAssembler : public Assembler {
   }
 
   void CheckEmitPoolsFor(size_t amount);
-  void EnsureEmitPoolsFor(size_t amount) {
+  virtual void EnsureEmitPoolsFor(size_t amount) VIXL_OVERRIDE {
     ptrdiff_t offset = amount;
     ptrdiff_t max_pools_size =
         literal_pool_.GetMaxSize() + veneer_pool_.GetMaxSize();
@@ -2974,6 +2946,14 @@ class MacroAssembler : public Assembler {
   CPURegList* GetScratchFPRegisterList() { return &fptmp_list_; }
   VIXL_DEPRECATED("GetScratchFPRegisterList", CPURegList* FPTmpList()) {
     return GetScratchFPRegisterList();
+  }
+
+  // Get or set the current (most-deeply-nested) UseScratchRegisterScope.
+  void SetCurrentScratchRegisterScope(UseScratchRegisterScope* scope) {
+    current_scratch_scope_ = scope;
+  }
+  UseScratchRegisterScope* GetCurrentScratchRegisterScope() {
+    return current_scratch_scope_;
   }
 
   // Like printf, but print at run-time from generated code.
@@ -3163,6 +3143,8 @@ class MacroAssembler : public Assembler {
   CPURegList tmp_list_;
   CPURegList fptmp_list_;
 
+  UseScratchRegisterScope* current_scratch_scope_;
+
   LiteralPool literal_pool_;
   VeneerPool veneer_pool_;
 
@@ -3190,55 +3172,14 @@ inline void LiteralPool::SetNextRecommendedCheckpoint(ptrdiff_t offset) {
   recommended_checkpoint_ = offset;
 }
 
-// Use this scope when you need a one-to-one mapping between methods and
-// instructions. This scope prevents the MacroAssembler from being called and
-// pools from being emitted. It also asserts the number of instructions emitted
-// is what you specified when creating the scope.
-class InstructionAccurateScope : public EmissionCheckScope {
+class InstructionAccurateScope : public ExactAssemblyScope {
  public:
-  InstructionAccurateScope(MacroAssembler* masm,
-                           int64_t count,
-                           AssertPolicy assert_policy = kExactSize)
-      : EmissionCheckScope(masm, (count * kInstructionSize), assert_policy) {
-    VIXL_ASSERT(assert_policy != kNoAssert);
-#ifdef VIXL_DEBUG
-    old_allow_macro_instructions_ = masm->AllowMacroInstructions();
-    masm->SetAllowMacroInstructions(false);
-#else
-    USE(old_allow_macro_instructions_);
-#endif
-  }
-
-  virtual ~InstructionAccurateScope() {
-#ifdef VIXL_DEBUG
-    MacroAssembler* masm = reinterpret_cast<MacroAssembler*>(assm_);
-    masm->SetAllowMacroInstructions(old_allow_macro_instructions_);
-#endif
-  }
-
- private:
-  InstructionAccurateScope(MacroAssembler* masm,
-                           int64_t count,
-                           AssertPolicy assert_policy,
-                           PoolPolicy pool_policy)
-      : EmissionCheckScope(masm,
-                           (count * kInstructionSize),
-                           assert_policy,
-                           pool_policy) {
-    VIXL_ASSERT(assert_policy != kNoAssert);
-#ifdef VIXL_DEBUG
-    old_allow_macro_instructions_ = masm->AllowMacroInstructions();
-    masm->SetAllowMacroInstructions(false);
-#endif
-  }
-
-  // Grant access to the above private constructor for pool emission methods.
-  friend void LiteralPool::Emit(LiteralPool::EmitOption);
-  friend void VeneerPool::Emit(VeneerPool::EmitOption, size_t);
-
-  bool old_allow_macro_instructions_;
+  VIXL_DEPRECATED("ExactAssemblyScope",
+                  InstructionAccurateScope(MacroAssembler* masm,
+                                           int64_t count,
+                                           SizePolicy size_policy = kExactSize))
+      : ExactAssemblyScope(masm, count * kInstructionSize, size_policy) {}
 };
-
 
 class BlockLiteralPoolScope {
  public:
@@ -3291,16 +3232,22 @@ class UseScratchRegisterScope {
   // This constructor implicitly calls `Open` to initialise the scope (`masm`
   // must not be `NULL`), so it is ready to use immediately after it has been
   // constructed.
-  explicit UseScratchRegisterScope(MacroAssembler* masm);
+  explicit UseScratchRegisterScope(MacroAssembler* masm)
+      : masm_(NULL), parent_(NULL), old_available_(0), old_availablefp_(0) {
+    Open(masm);
+  }
   // This constructor does not implicitly initialise the scope. Instead, the
   // user is required to explicitly call the `Open` function before using the
   // scope.
-  UseScratchRegisterScope();
+  UseScratchRegisterScope()
+      : masm_(NULL), parent_(NULL), old_available_(0), old_availablefp_(0) {}
+
   // This function performs the actual initialisation work.
   void Open(MacroAssembler* masm);
 
   // The destructor always implicitly calls the `Close` function.
-  ~UseScratchRegisterScope();
+  ~UseScratchRegisterScope() { Close(); }
+
   // This function performs the cleaning-up work. It must succeed even if the
   // scope has not been opened. It is safe to call multiple times.
   void Close();
@@ -3311,10 +3258,18 @@ class UseScratchRegisterScope {
 
   // Take a register from the appropriate temps list. It will be returned
   // automatically when the scope ends.
-  Register AcquireW() { return AcquireNextAvailable(available_).W(); }
-  Register AcquireX() { return AcquireNextAvailable(available_).X(); }
-  VRegister AcquireS() { return AcquireNextAvailable(availablefp_).S(); }
-  VRegister AcquireD() { return AcquireNextAvailable(availablefp_).D(); }
+  Register AcquireW() {
+    return AcquireNextAvailable(masm_->GetScratchRegisterList()).W();
+  }
+  Register AcquireX() {
+    return AcquireNextAvailable(masm_->GetScratchRegisterList()).X();
+  }
+  VRegister AcquireS() {
+    return AcquireNextAvailable(masm_->GetScratchFPRegisterList()).S();
+  }
+  VRegister AcquireD() {
+    return AcquireNextAvailable(masm_->GetScratchFPRegisterList()).D();
+  }
 
 
   Register AcquireRegisterOfSize(int size_in_bits);
@@ -3326,7 +3281,7 @@ class UseScratchRegisterScope {
     return AcquireVRegisterOfSize(reg.GetSizeInBits());
   }
   CPURegister AcquireCPURegisterOfSize(int size_in_bits) {
-    return available_->IsEmpty()
+    return masm_->GetScratchRegisterList()->IsEmpty()
                ? CPURegister(AcquireVRegisterOfSize(size_in_bits))
                : CPURegister(AcquireRegisterOfSize(size_in_bits));
   }
@@ -3382,14 +3337,15 @@ class UseScratchRegisterScope {
 
   static void ExcludeByRegList(CPURegList* available, RegList exclude);
 
-  // Available scratch registers.
-  CPURegList* available_;    // kRegister
-  CPURegList* availablefp_;  // kVRegister
+  // The MacroAssembler maintains a list of available scratch registers, and
+  // also keeps track of the most recently-opened scope so that on destruction
+  // we can check that scopes do not outlive their parents.
+  MacroAssembler* masm_;
+  UseScratchRegisterScope* parent_;
 
   // The state of the available lists at the start of this scope.
   RegList old_available_;    // kRegister
   RegList old_availablefp_;  // kVRegister
-  bool initialised_;
 
   // Disallow copy constructor and operator=.
   VIXL_DEBUG_NO_RETURN UseScratchRegisterScope(const UseScratchRegisterScope&) {
@@ -3418,7 +3374,7 @@ void MacroAssembler::CallRuntime(R (*function)(P...)) {
     Label start;
     bind(&start);
     {
-      InstructionAccurateScope scope(this, 1);
+      ExactAssemblyScope scope(this, kInstructionSize);
       hlt(kRuntimeCallOpcode);
     }
     VIXL_ASSERT(GetSizeOfCodeGeneratedSince(&start) ==
