@@ -138,6 +138,14 @@ cc_library {
     vndk: {
         enabled: true,
     },
+
+    target: {
+        android: {
+            lto: {
+                 thin: true,
+            },
+        },
+    },
 }
 
 cc_library {
@@ -155,6 +163,14 @@ cc_library {
     vendor_available: true,
     vndk: {
         enabled: true,
+    },
+
+    target: {
+        android: {
+            lto: {
+                 thin: true,
+            },
+        },
     },
 }
 
